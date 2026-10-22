@@ -43,9 +43,9 @@ Optional, once, inside Claude Code (bell + picker cache for the Claude side):
 | Key              | Action                                                        |
 | ---------------- | ------------------------------------------------------------- |
 | `prefix` + `y`   | Claude Code popup for the current directory (upstream)        |
-| `prefix` + `u`   | Claude agent picker with live status (upstream)               |
 | `prefix` + `Y`   | Codex popup for the current directory                         |
-| `prefix` + `U`   | All agent popups, Claude and Codex (`enter` open, `ctrl-x` kill) |
+| `prefix` + `u`   | All agent popups, Claude and Codex (`enter` open, `ctrl-x` kill) |
+| `prefix` + `U`   | Claude-only picker with live working/waiting status (upstream) |
 | `prefix` + `d`   | Close the popup; the session keeps running                    |
 | `Option` + arrow | Resize the current pane by 3 cells                            |
 
@@ -66,21 +66,22 @@ documented in the upstream README; the Codex side mirrors them:
 
 ```tmux
 set -g @codex_launch_key     'Y'
-set -g @codex_list_key       'U'
+set -g @codex_list_key       'u'        # all-agents list
+set -g @claude_list_key      'U'        # upstream Claude-only picker
 set -g @codex_command        'codex'
 set -g @codex_args           ''        # e.g. '--full-auto'
 set -g @codex_session_prefix 'codex-'
-set -g @hatch_list_prefixes  'claude- codex-'   # session-name prefixes listed by prefix+U
+set -g @hatch_list_prefixes  'claude- codex-'   # session-name prefixes listed by prefix+u
 ```
 
 Popup size is shared: `@claude_popup_width` / `@claude_popup_height`.
 
 ## Limitations
 
-- The all-agents list (`prefix` + `U`) shows kind, age and path only; it is
+- The all-agents list (`prefix` + `u`) shows kind, age and path only; it is
   driven by tmux session names, not by the agents. Codex writes no live status
   file the way Claude Code does, so there is no working/waiting indicator there.
-  `prefix` + `u` (upstream) still gives live status for Claude.
+  `prefix` + `U` (upstream) still gives live status for Claude.
 - No bell forwarding for Codex yet. Codex's `notify` hook could ring one, but
   it accepts a single command, so it needs a wrapper if you already use it.
 
