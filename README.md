@@ -87,6 +87,12 @@ Copy mode (`prefix` + `[`, vi keys):
 A stale status file (crashed agent, recycled pid) is ignored: a row only
 counts while the pid still has the start time the file recorded.
 
+The Codex TUI runs its session in the app-server daemon, so its hooks fire
+under the daemon rather than the TUI. The hook maps them back to the TUI by
+matching the session's cwd against tmux panes that host a `codex` process.
+Two Codex TUIs started in the same directory outside the hatch are therefore
+told apart only by which one a session claimed first.
+
 ## Options
 
 Set before `source-file` in `~/.tmux.conf` (defaults shown in
