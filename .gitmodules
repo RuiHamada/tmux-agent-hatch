@@ -1,0 +1,3 @@
+[submodule "vendor/tmux-claude-hatch"]
+	path = vendor/tmux-claude-hatch
+	url = https://github.com/craftzdog/tmux-claude-hatch
