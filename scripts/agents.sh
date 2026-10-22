@@ -81,7 +81,13 @@ render() {
     TZ=UTC LC_ALL=C ps -o pid=,tty=,lstart= -p "$(printf '%s\n' "$1" | cut -f1 | paste -sd, -)" 2>/dev/null |
       awk '{ print "P\t" $1 "\t" $2 "\t" $3 " " $4 " " $5 " " $6 " " $7 }'
     [ -r /proc/self/stat ] && proc_starts "$1"
-    tmux list-panes -a -F $'T\t#{pane_tty}\t#{pane_id}\t#{session_name}\t#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null
+    # tmux 3.4 (Linux distros) replaces a tab inside -F output with "_", so the
+    # fields come space-separated with the free-text session name last, and are
+    # re-joined with tabs here. (modified from tmux-claude-hatch)
+    tmux list-panes -a -F '#{pane_tty} #{pane_id} #{window_index}.#{pane_index} #{session_name}' 2>/dev/null |
+      while read -r tty_ pane_ wp_ sess_; do
+        printf 'T\t%s\t%s\t%s\t%s:%s\n' "$tty_" "$pane_" "$sess_" "$sess_" "$wp_"
+      done
     printf '%s\n' "$1" | sed $'s/^/A\t/'
   } | awk -F'\t' -v now="$(date +%s)" -v home="$HOME" -v prefixes="$(hatch_prefixes)" '
     BEGIN { np = split(prefixes, pfx, " ") }

@@ -52,8 +52,10 @@ is_codex() {
 # process or a direct child of it (a dedicated session runs codex as the pane
 # command; a loose one runs it under the pane's shell).
 pane_codex_pids() {
-  tmux list-panes -a -F $'#{pane_pid}\t#{pane_current_path}' 2>/dev/null |
-    while IFS=$'\t' read -r ppid_ path_; do
+  # Space-separated (tmux 3.4 mangles tabs in -F output); the path, which may
+  # contain spaces, is last so `read` keeps it whole.
+  tmux list-panes -a -F '#{pane_pid} #{pane_current_path}' 2>/dev/null |
+    while read -r ppid_ path_; do
       if is_codex "$ppid_"; then
         printf '%s\t%s\n' "$ppid_" "$path_"
         continue
@@ -64,7 +66,12 @@ pane_codex_pids() {
     done
 }
 
-if [ -n "$codex_pid" ] && [ "$(ps -o tty= -p "$codex_pid" 2>/dev/null | tr -d ' ')" = '??' ]; then
+# No controlling tty: "??" on macOS, "?" on Linux.
+case "$(ps -o tty= -p "${codex_pid:-0}" 2>/dev/null | tr -d ' ')" in
+'?' | '??') no_tty=1 ;;
+*) no_tty='' ;;
+esac
+if [ -n "$codex_pid" ] && [ -n "$no_tty" ]; then
   # Case 2. Prefer a pane whose cwd matches; among several, the one not yet
   # claimed by a different live session; finally the newest.
   codex_pid=""
@@ -117,9 +124,18 @@ SessionEnd)
 *) exit 0 ;;
 esac
 
-# Start time in the exact shape agents.sh compares against (ps lstart, UTC,
-# single-spaced), so a recycled pid is never mistaken for a live agent.
-start="$(TZ=UTC LC_ALL=C ps -o lstart= -p "$codex_pid" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')"
+# Start time in the exact shape agents.sh compares against, so a recycled pid
+# is never mistaken for a live agent. Linux: field 22 of /proc/<pid>/stat (what
+# Claude Code records there too). Elsewhere: ps lstart in UTC, single-spaced.
+start=""
+if [ -r "/proc/$codex_pid/stat" ]; then
+  IFS= read -r stat_ <"/proc/$codex_pid/stat" 2>/dev/null
+  # shellcheck disable=SC2086 # deliberate split past the ") " that ends the comm field
+  set -- ${stat_##*) }
+  [ $# -ge 20 ] && start="${20}"
+else
+  start="$(TZ=UTC LC_ALL=C ps -o lstart= -p "$codex_pid" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')"
+fi
 [ -n "$start" ] || exit 0
 
 mkdir -p "$dir" 2>/dev/null || exit 0
