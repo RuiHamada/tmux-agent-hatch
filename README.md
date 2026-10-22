@@ -106,6 +106,7 @@ It does three things, each also available alone as `--tmux`, `--codex`,
 | `prefix` + `W`   | New git worktree + a window for it + an agent popup over that window (asks for branch and agent) |
 | `prefix` + `d`   | Close the popup and go back to your window; the agent keeps running        |
 | `Option` + arrow | Resize the current pane by 3 cells                                         |
+| `prefix` + `"` / `%` / `c` | Split or new window **in the current pane's directory** (tmux's default would use the session's start directory, which is wrong inside a worktree window) |
 
 Inside the picker:
 
