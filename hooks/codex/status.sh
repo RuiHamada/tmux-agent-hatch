@@ -9,10 +9,14 @@
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Set HATCH_DEBUG_LOG=/path to trace what each invocation saw and did.
+log() { [ -n "${HATCH_DEBUG_LOG:-}" ] && printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$HATCH_DEBUG_LOG" 2>/dev/null; return 0; }
+
 input="$(cat 2>/dev/null)"
 event="$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)"
 sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+log "event=$event ppid=$PPID tmux_pane=${TMUX_PANE:-} input=${input:0:120}"
 [ -n "$event" ] || exit 0
 
 dir="${CODEX_HOME:-$HOME/.codex}/hatch-status"
@@ -29,6 +33,7 @@ for _ in 1 2 3 4 5; do
   esac
   pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
 done
+log "codex_pid=${codex_pid:-none} chain-from=$PPID"
 [ -n "$codex_pid" ] || exit 0
 
 file="${dir:?}/${codex_pid:?}.json"
@@ -51,6 +56,7 @@ PermissionRequest) status=waiting ;;
 Stop)              status=idle ;;
 SessionEnd)
   rm -f "${file:?}" 2>/dev/null
+  log "removed $file"
   refresh 0.3
   exit 0
   ;;
@@ -68,8 +74,9 @@ if jq -n --argjson pid "$codex_pid" --arg status "$status" --arg sid "$sid" --ar
   --argjson now "$(( $(date +%s) * 1000 ))" --arg start "$start" \
   '{kind: "interactive", agent: "codex", pid: $pid, status: $status, sessionId: $sid, cwd: $cwd,
     statusUpdatedAt: $now, procStart: $start}' >"$tmp" 2>/dev/null; then
-  mv -f "$tmp" "$file" 2>/dev/null
+  mv -f "$tmp" "$file" 2>/dev/null && log "wrote $file status=$status"
 else
+  log "jq failed for $file"
   rm -f "${tmp:?}" 2>/dev/null
 fi
 
