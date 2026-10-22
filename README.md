@@ -45,7 +45,6 @@ Optional, once, inside Claude Code (bell + picker cache for the Claude side):
 | `prefix` + `y`   | Claude Code popup for the current directory (upstream)        |
 | `prefix` + `Y`   | Codex popup for the current directory                         |
 | `prefix` + `u`   | All agent popups, Claude and Codex (`enter` open, `ctrl-x` kill) |
-| `prefix` + `U`   | Claude-only picker with live working/waiting status (upstream) |
 | `prefix` + `d`   | Close the popup; the session keeps running                    |
 | `Option` + arrow | Resize the current pane by 3 cells                            |
 
@@ -67,7 +66,6 @@ documented in the upstream README; the Codex side mirrors them:
 ```tmux
 set -g @codex_launch_key     'Y'
 set -g @codex_list_key       'u'        # all-agents list
-set -g @claude_list_key      'U'        # upstream Claude-only picker
 set -g @codex_command        'codex'
 set -g @codex_args           ''        # e.g. '--full-auto'
 set -g @codex_session_prefix 'codex-'
@@ -81,7 +79,8 @@ Popup size is shared: `@claude_popup_width` / `@claude_popup_height`.
 - The all-agents list (`prefix` + `u`) shows kind, age and path only; it is
   driven by tmux session names, not by the agents. Codex writes no live status
   file the way Claude Code does, so there is no working/waiting indicator there.
-  `prefix` + `U` (upstream) still gives live status for Claude.
+  The upstream Claude-only picker is unbound; set your own `@claude_list_key`
+  and remove the `unbind-key` line in `hatch.tmux.conf` if you want it back.
 - No bell forwarding for Codex yet. Codex's `notify` hook could ring one, but
   it accepts a single command, so it needs a wrapper if you already use it.
 
