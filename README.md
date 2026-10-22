@@ -7,7 +7,7 @@ back to your editor; the session keeps running in a nested tmux session.
 Built on top of [craftzdog/tmux-claude-hatch](https://github.com/craftzdog/tmux-claude-hatch)
 (vendored as a git submodule, used unmodified) and adds:
 
-- a Codex launcher and session list on separate keys
+- a Codex launcher, and one list of every agent popup (Claude and Codex)
 - pane resizing with <kbd>Option</kbd> + arrows
 - vi-style copy mode that copies to the macOS clipboard
 
@@ -45,7 +45,7 @@ Optional, once, inside Claude Code (bell + picker cache for the Claude side):
 | `prefix` + `y`   | Claude Code popup for the current directory (upstream)        |
 | `prefix` + `u`   | Claude agent picker with live status (upstream)               |
 | `prefix` + `Y`   | Codex popup for the current directory                         |
-| `prefix` + `U`   | Codex session list (`enter` open, `ctrl-x` kill)              |
+| `prefix` + `U`   | All agent popups, Claude and Codex (`enter` open, `ctrl-x` kill) |
 | `prefix` + `d`   | Close the popup; the session keeps running                    |
 | `Option` + arrow | Resize the current pane by 3 cells                            |
 
@@ -70,14 +70,17 @@ set -g @codex_list_key       'U'
 set -g @codex_command        'codex'
 set -g @codex_args           ''        # e.g. '--full-auto'
 set -g @codex_session_prefix 'codex-'
+set -g @hatch_list_prefixes  'claude- codex-'   # session-name prefixes listed by prefix+U
 ```
 
 Popup size is shared: `@claude_popup_width` / `@claude_popup_height`.
 
 ## Limitations
 
-- The Codex list shows name, age and path only. Codex writes no live status
-  file the way Claude Code does, so there is no working/waiting indicator.
+- The all-agents list (`prefix` + `U`) shows kind, age and path only; it is
+  driven by tmux session names, not by the agents. Codex writes no live status
+  file the way Claude Code does, so there is no working/waiting indicator there.
+  `prefix` + `u` (upstream) still gives live status for Claude.
 - No bell forwarding for Codex yet. Codex's `notify` hook could ring one, but
   it accepts a single command, so it needs a wrapper if you already use it.
 

@@ -10,4 +10,4 @@ list_key="$(get_tmux_option @codex_list_key 'U')"
 tmux bind-key "$launch_key" \
   run-shell "$DIR/launch-codex.sh '#{q:pane_current_path}' '#{q:window_id}'"
 tmux bind-key "$list_key" \
-  run-shell "$DIR/list-codex.sh '#{q:client_name}'"
+  run-shell "$DIR/list-agents.sh '#{q:client_name}'"
