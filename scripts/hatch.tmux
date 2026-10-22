@@ -12,6 +12,7 @@ CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 claude_key="$(get_tmux_option @claude_launch_key 'y')"
 codex_key="$(get_tmux_option @codex_launch_key 'Y')"
 list_key="$(get_tmux_option @hatch_list_key 'u')"
+worktree_key="$(get_tmux_option @hatch_worktree_key 'W')"
 
 # Launch (or re-attach to) an agent session for the current pane's directory.
 # #{pane_current_path} / #{window_id} are expanded by run-shell before the args
@@ -25,6 +26,12 @@ tmux bind-key "$codex_key" \
 # closes that popup first so the picker opens full-size on the outer client.
 tmux bind-key "$list_key" \
   run-shell "$CURRENT_DIR/list.sh '#{q:client_name}'"
+
+# New worktree + review window + agent popup. Asks for the branch and the agent
+# (default codex) on the status line.
+tmux bind-key "$worktree_key" \
+  command-prompt -p 'worktree branch:,agent (claude|codex):' -I ',codex' \
+  "run-shell \"$CURRENT_DIR/worktree.sh '%2' '%1' '#{q:pane_current_path}'\""
 
 # Forward a bell from a dedicated session to its origin window's pane, so
 # tmux's own bell machinery (window-status-bell-style, and terminal

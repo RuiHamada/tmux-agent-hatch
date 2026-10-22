@@ -46,6 +46,8 @@ of them, without giving up anything upstream does well.
   was launched from, then resumes it in a popup over it.
 - **Two launchers** — `prefix` + `y` opens (or re-attaches to) Claude Code for
   the current directory, `prefix` + `Y` does the same for Codex.
+- **Worktree launcher** — `prefix` + `W` creates a git worktree, a window to
+  review it in, and an agent popup over that window, in one go.
 - **Quick kill** (`ctrl-x`) and **copy location** (`ctrl-y`) from the picker.
 - **Bell forwarding** — a bell in a popup session highlights the window you
   launched it from, for both agents.
@@ -101,6 +103,7 @@ It does three things, each also available alone as `--tmux`, `--codex`,
 | `prefix` + `y`   | Launch (or re-attach to) **Claude Code** for the current directory, in a popup |
 | `prefix` + `Y`   | Launch (or re-attach to) **Codex** for the current directory, in a popup   |
 | `prefix` + `u`   | Open the agent picker                                                       |
+| `prefix` + `W`   | New git worktree + a window for it + an agent popup over that window (asks for branch and agent) |
 | `prefix` + `d`   | Close the popup and go back to your window; the agent keeps running        |
 | `Option` + arrow | Resize the current pane by 3 cells                                         |
 
@@ -138,6 +141,25 @@ Copy mode (`prefix` + `[`, vi keys):
 | `Esc`         | Leave copy mode                        |
 | mouse drag    | Copy on release                        |
 
+## Worktrees
+
+`prefix` + `W` is for the "one agent per worktree" workflow. It asks for a
+branch name and an agent (default `codex`) on the status line, then:
+
+1. creates the worktree at `../<repo>-wt/<branch>` (reusing it if it exists;
+   creating the branch if it doesn't),
+2. opens a window named after the branch in your current session, with the
+   worktree as its directory — this is where you review the code,
+3. launches the agent popup over that window, so `prefix` + `d` drops you
+   into the review window and the picker jumps back to it.
+
+Each worktree gets its own agent session (the session name is derived from the
+directory), so several worktrees of one repository run side by side.
+Removing the worktree afterwards is up to you (`git worktree remove`).
+
+Set `@hatch_worktree_dir` to put worktrees somewhere else; `@hatch_worktree_key`
+to rebind.
+
 ## Options
 
 Set any of these before the `source-file` line in `~/.tmux.conf` (defaults
@@ -148,6 +170,8 @@ not agent-specific, apply to both agents.
 set -g @claude_launch_key     'y'        # prefix key: Claude Code for current dir
 set -g @codex_launch_key      'Y'        # prefix key: Codex for current dir
 set -g @hatch_list_key        'u'        # prefix key: open the picker
+set -g @hatch_worktree_key    'W'        # prefix key: worktree + window + popup
+set -g @hatch_worktree_dir    ''         # where worktrees go; default ../<repo>-wt
 set -g @claude_command        'claude'   # command run in new Claude sessions
 set -g @codex_command         'codex'    # command run in new Codex sessions
 set -g @claude_args           ''         # extra args for Claude
