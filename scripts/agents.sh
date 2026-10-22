@@ -50,6 +50,34 @@ codex_recs() {
     | [.pid, .status, .sessionId, .cwd, $seen, .procStart, "codex", "1"] | @tsv' "${files[@]}" 2>/dev/null
 }
 
+# codex_pane_recs <known-pids>
+# Codex processes that live in a tmux pane (as the pane's own process or a direct
+# child of its shell) but have no status file yet: just started, or started
+# before its hooks were trusted. Listed with an unknown status so they can still
+# be jumped to and killed; the first hook event replaces the row with a real
+# status. One `ps` over all processes, one `tmux list-panes`.
+#   Rec: pid \t unknown \t \t pane-path \t \t \t codex \t
+codex_pane_recs() {
+  local panes
+  panes="$(tmux list-panes -a -F '#{pane_pid} #{pane_current_path}' 2>/dev/null)"
+  [ -n "$panes" ] || return 0
+  {
+    printf '%s\n' "$panes" | sed 's/^/N /'
+    printf '%s\n' "$1" | sed 's/^/K /'
+    LC_ALL=C ps -axo pid=,ppid=,comm= 2>/dev/null | sed 's/^/P /'
+  } | awk '
+    $1 == "N" { path = $0; sub(/^N [0-9]+ /, "", path); pane[$2] = path; next }
+    $1 == "K" && $2 != "" { known[$2] = 1; next }
+    $1 == "P" {
+      c = $4; sub(/.*\//, "", c)
+      if (c !~ /^codex/ || ($2 in known)) next
+      if      ($2 in pane) path = pane[$2]
+      else if ($3 in pane) path = pane[$3]
+      else next
+      printf "%s\tunknown\t\t%s\t\t\tcodex\t\n", $2, path
+    }'
+}
+
 # well_formed <recs>: every verified rec carries pid, status, cwd and proc-start.
 # A rec missing one means the file format moved on; the caller falls back.
 well_formed() {
@@ -141,8 +169,10 @@ claude="$(claude_file_recs)"
 well_formed "$claude" || claude="$(claude_cli_recs)"
 codex="$(codex_recs)"
 well_formed "$codex" || codex=''
+# Pass every pid we already know about, so a Codex with a status file is not listed twice.
+codex_extra="$(codex_pane_recs "$(printf '%s\n%s\n' "$claude" "$codex" | cut -f1 | paste -sd' ' -)")"
 
-recs="$(printf '%s\n%s\n' "$claude" "$codex" | sed '/^$/d')"
+recs="$(printf '%s\n%s\n%s\n' "$claude" "$codex" "$codex_extra" | sed '/^$/d')"
 [ -n "$recs" ] || exit 0
 out="$(render "$recs")"
 [ -n "$out" ] && printf '%s\n' "$out"
