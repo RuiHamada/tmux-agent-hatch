@@ -51,7 +51,7 @@ of them, without giving up anything upstream does well.
 - **Quick kill** (`ctrl-x`) and **copy location** (`ctrl-y`) from the picker.
 - **Bell forwarding** — a bell in a popup session highlights the window you
   launched it from, for both agents.
-- **Pane movement** with <kbd>Option</kbd> + arrows, and a **vi-style copy
+- **Pane resize** with <kbd>Option</kbd> + arrows, and a **vi-style copy
   mode** that copies to the macOS clipboard — the two tmux niceties you end up
   wanting the moment you live in popups.
 - **Upstream tracking** — the upstream scripts are vendored as a modified copy
@@ -105,7 +105,7 @@ It does three things, each also available alone as `--tmux`, `--codex`,
 | `prefix` + `u`   | Open the agent picker                                                       |
 | `prefix` + `W`   | New git worktree + a window for it + an agent popup over that window (asks for branch and agent) |
 | `prefix` + `d`   | Close the popup and go back to your window; the agent keeps running        |
-| `Option` + arrow | Move between panes (resize is tmux's default `prefix` + `Ctrl` + arrow)   |
+| `Option` + arrow | Resize the current pane by 3 cells                                         |
 | `prefix` + `"` / `%` / `c` | Split or new window **in the current pane's directory** (tmux's default would use the session's start directory, which is wrong inside a worktree window) |
 
 Inside the picker:
