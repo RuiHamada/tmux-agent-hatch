@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/refresh-cache.sh\"" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/refresh-cache.sh\"" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion", "hooks": [
+        { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/bell.sh\"" },
+        { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/refresh-cache.sh\"" }
+      ] }
+    ],
+    "Notification": [
+      { "matcher": "permission_prompt", "hooks": [
+        { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/bell.sh\"" },
+        { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/refresh-cache.sh\"" }
+      ] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/bell.sh\"" },
+        { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/refresh-cache.sh\"" }
+      ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/refresh-cache.sh\" 0.3" } ] }
+    ]
+  }
+}

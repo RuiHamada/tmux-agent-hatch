@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "SessionStart":      [ { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/codex/status.sh\"" } ] } ],
+    "UserPromptSubmit":  [ { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/codex/status.sh\"" } ] } ],
+    "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/codex/status.sh\"" } ] } ],
+    "Stop":              [ { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/codex/status.sh\"" } ] } ],
+    "SessionEnd":        [ { "hooks": [ { "type": "command", "command": "bash \"__HATCH_DIR__/hooks/codex/status.sh\"" } ] } ]
+  }
+}

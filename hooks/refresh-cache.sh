@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Refresh the picker's agent cache whenever an agent (Claude or Codex) changes state.
+#
+#   refresh-cache.sh [delay]   optional seconds to wait first, e.g. for the
+#                              process to exit on SessionEnd.
+#
+# picker.sh paints its first frame from the cache (unless @claude_picker_cache is off).
+# Claude's hooks fire at exactly the moments that status changes, so refreshing
+# here keeps that first paint honest.
+#
+# Never fails and never prints: hook output lands in the transcript, and a failed
+# refresh must not fail the turn.
+
+# Only when this agent is itself inside tmux. agents.sh pairs each Claude with a
+# tmux pane and emits nothing when it cannot reach a server — refreshing from a
+# Claude running outside tmux would overwrite a good cache with an empty one.
+[ -n "${TMUX:-}" ] || exit 0
+
+# (modified from tmux-claude-hatch: the picker lives in this repo's scripts/)
+picker="$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)/picker.sh"
+[ -x "$picker" ] || exit 0
+
+# Detached, so the turn never waits on agents.sh (nor on the delay).
+# Concurrent refreshes from several agents are safe: --list writes a temp file
+# and renames it over the cache, which is atomic.
+delay="${1:-0}"
+( { [ "$delay" != 0 ] && sleep "$delay"; "$picker" --list; } >/dev/null 2>&1 & )
+
+exit 0
