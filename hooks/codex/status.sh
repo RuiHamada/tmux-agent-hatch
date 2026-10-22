@@ -21,8 +21,13 @@ log "event=$event ppid=$PPID tmux_pane=${TMUX_PANE:-} input=${input:0:120}"
 
 dir="${CODEX_HOME:-$HOME/.codex}/hatch-status"
 
-# The hook runs as a child (or grandchild, via sh -c) of the Codex process. Walk
-# up the parent chain until the command name looks like codex.
+# Which Codex process owns this session? Two cases:
+#
+# 1. The hook runs as a child (or grandchild, via sh -c) of the Codex TUI: walk
+#    up the parent chain until the command name looks like codex.
+# 2. The TUI hands the session to the app-server daemon, and the hook runs under
+#    the daemon, which has no tty and lives in no tmux pane. Then find the TUI by
+#    matching the payload's cwd against the tmux panes that host a codex process.
 pid="$PPID"
 codex_pid=""
 for _ in 1 2 3 4 5; do
@@ -33,7 +38,56 @@ for _ in 1 2 3 4 5; do
   esac
   pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
 done
-log "codex_pid=${codex_pid:-none} chain-from=$PPID"
+found_by=chain
+
+# is_codex <pid>: command name looks like codex.
+is_codex() {
+  local c
+  c="$(ps -o comm= -p "$1" 2>/dev/null)"
+  case "${c##*/}" in codex*) return 0 ;; esac
+  return 1
+}
+
+# pane_codex_pids: one "pid<TAB>cwd" per codex process that is a tmux pane's own
+# process or a direct child of it (a dedicated session runs codex as the pane
+# command; a loose one runs it under the pane's shell).
+pane_codex_pids() {
+  tmux list-panes -a -F $'#{pane_pid}\t#{pane_current_path}' 2>/dev/null |
+    while IFS=$'\t' read -r ppid_ path_; do
+      if is_codex "$ppid_"; then
+        printf '%s\t%s\n' "$ppid_" "$path_"
+        continue
+      fi
+      for c in $(pgrep -P "$ppid_" 2>/dev/null); do
+        is_codex "$c" && printf '%s\t%s\n' "$c" "$path_"
+      done
+    done
+}
+
+if [ -n "$codex_pid" ] && [ "$(ps -o tty= -p "$codex_pid" 2>/dev/null | tr -d ' ')" = '??' ]; then
+  # Case 2. Prefer a pane whose cwd matches; among several, the one not yet
+  # claimed by a different live session; finally the newest.
+  codex_pid=""
+  found_by=pane
+  best=""
+  # Compare physical paths: tmux reports /private/tmp/x where the payload may say /tmp/x.
+  canon() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+  want="$(canon "$cwd")"
+  while IFS=$'\t' read -r cpid cpath; do
+    [ -n "$cpid" ] || continue
+    [ "$(canon "$cpath")" = "$want" ] || continue
+    owner="$(jq -r '.sessionId // empty' "$dir/$cpid.json" 2>/dev/null)"
+    if [ -z "$owner" ] || [ "$owner" = "$sid" ]; then
+      codex_pid="$cpid"
+      break
+    fi
+    best="$cpid"
+  done <<EOF_PANES
+$(pane_codex_pids)
+EOF_PANES
+  [ -n "$codex_pid" ] || codex_pid="$best"
+fi
+log "codex_pid=${codex_pid:-none} by=$found_by chain-from=$PPID"
 [ -n "$codex_pid" ] || exit 0
 
 file="${dir:?}/${codex_pid:?}.json"
