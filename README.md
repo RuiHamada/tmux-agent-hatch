@@ -123,6 +123,11 @@ process, not by its tmux session. So several agents in one project show up
 separately, as does one you started by hand in an ordinary pane (marked
 `loose`).
 
+To run a second agent in the same directory, open a new window inside the
+popup (`prefix` + `c`, since the popup is an ordinary nested tmux session)
+and start `claude` or `codex` there. Both appear in the picker and `enter`
+jumps to the right window.
+
 Copy mode (`prefix` + `[`, vi keys):
 
 | Key           | Action                                 |
