@@ -62,7 +62,10 @@ workstation and sends the notification env). After that, "on the workstation, fi
 ~/Git/tmux-agent-hatch/openclaw/uninstall.sh --purge    # also OpenClaw itself and ~/.openclaw
 ```
 
-hatch itself (`scripts/`, `hooks/`, `hatch.tmux.conf`) is untouched; deleting this directory restores the original.
+hatch itself is touched in two small places so that both sides meet: `scripts/helpers.sh` has `worktree_path` (shared
+by prefix+W and `hatch-launch --worktree`) and `delegated_session`, and `scripts/launch.sh` uses the latter so that
+prefix+y / prefix+Y in a directory opens a session the bridge started there instead of starting a second agent.
+Without this directory those helpers simply never match, and hatch behaves as before.
 
 ## One task per session, report.md, ledger
 
@@ -70,8 +73,10 @@ Countermeasures for problems seen when driving agents through chat: too many tas
 reports that never arrive, and reports accepted without verification.
 
 - **One task per session**: `hatch-launch` always creates a new session `<prefix><slug>` (`-2`, `-3` on collision).
-  Follow-up instructions go to an existing session only with `--reuse`. `--worktree` creates
-  `~/.agents/worktrees/<repo>-<slug>` (branch `hatch/<slug>`) and launches there.
+  Follow-up instructions go to an existing session only with `--reuse`. `--worktree` creates or reuses a worktree
+  in the same place as hatch's prefix+W (`@hatch_worktree_dir/<branch>`, by default `<repo>-wt/<branch>` next to the
+  repository; the branch is the slug, or `--branch <name>`), so a worktree made from chat and one made from the
+  keyboard are the same tree.
 - **Directory check**: the directory must be inside a git repository; a parent of several repositories (such as `~/Git`)
   is refused with the candidates listed. `--any-dir` launches outside a repository on purpose. This prevents
   mistakes like running a review from the parent directory.

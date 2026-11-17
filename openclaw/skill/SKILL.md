@@ -22,7 +22,7 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
 |---|---|
 | `hatch-launch [--slug <slug>] [--expect "<what to verify>"] <claude\|codex> <dir> "<instructions>"` | Start an implementation task (a writer) in a new session. slug is the task name (e.g. `fix-login-500`). The agent is told to write report.md when done. Note `session=` `slug=` `out=` from the output. A ledger row is added automatically |
 | `hatch-launch --readonly ...` | Investigation / review. Claude runs in plan mode, Codex in a read-only sandbox; files cannot be changed. The final response is saved as report.md automatically. May run alongside a writer in the same dir |
-| `hatch-launch --worktree ...` | Create a git worktree (`~/.agents/worktrees/<repo>-<slug>`, branch `hatch/<slug>`) and launch there. **Only when the user asks for a worktree** |
+| `hatch-launch --worktree ...` | Create (or reuse) a git worktree and launch there. Same place as the user's own prefix+W: `<repo>-wt/<branch>` next to the repository; the branch is the slug, or `--branch <name>`. **Only when the user asks for a worktree** |
 | `hatch-launch --reuse ...` | Old behaviour: send the instructions to the existing session for the same dir. **Only for a follow-up of the same task** |
 | `hatch-report <session>` | Read the agent's report.md (Summary / Changed / Validation / Handoff). Prints "no report yet" if absent |
 | `hatch-ledger list` | Open tasks: age, host, session, slug, expect, note. `--all` adds closed tasks and whether each session is still alive |
@@ -55,7 +55,8 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
    `hatch-launch --slug <slug> --expect "<what the report must show>" ...`.
    If the request contains several independent pieces of work, launch each with its own slug (do not pile them
    onto one session). Investigation, review and consultation get `--readonly`.
-   Tell the user the session name and slug, and that it can be opened from the terminal picker.
+   Tell the user the session name and slug, and that it can be opened from the terminal: the picker (prefix+u), or
+   prefix+y / prefix+Y in a pane of that directory, which opens this session as a popup.
 2. **Wait.** No polling: when the agent finishes or needs input, a notification (wake) arrives:
    `[hatch] <agent> <session> on <host>: ... slug=<slug> report=READY|MISSING`.
 3. **On a notification**

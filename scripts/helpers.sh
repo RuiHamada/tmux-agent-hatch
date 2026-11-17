@@ -99,3 +99,36 @@ is_hatch_session() {
 agent_option() {
   get_tmux_option "@$1_$2" "$3"
 }
+
+# worktree_path <repo-root> <branch>
+# Where the worktree for a branch lives: @hatch_worktree_dir/<branch>, defaulting to a sibling of the
+# repository named <repo>-wt. Shared by worktree.sh (prefix+W) and openclaw/bin/hatch-launch --worktree,
+# so a worktree made one way is found by the other.
+worktree_path() {
+  local base
+  base="$(get_tmux_option @hatch_worktree_dir '')"
+  [ -n "$base" ] || base="$(dirname "$1")/$(basename "$1")-wt"
+  printf '%s/%s' "$base" "$2"
+}
+
+# delegated_session <session-prefix> <dir>
+# A session that openclaw/bin/hatch-launch started for this agent in this directory (its name is
+# <prefix><slug>, not the directory hash). Prints the best match: a writer before a read-only one,
+# then the newest. Prints nothing when there is none.
+delegated_session() {
+  local prefix="$1" want name created spath best="" best_rank=-1 best_created=0 rank
+  want="$(cd "$2" 2>/dev/null && pwd -P)" || return 0
+  while read -r name created spath; do
+    case "$name" in "$prefix"*) ;; *) continue ;; esac
+    [ "$(cd "$spath" 2>/dev/null && pwd -P)" = "$want" ] || continue
+    [ "$(tmux show-options -t "$name" -qv @hatch_openclaw 2>/dev/null)" = 1 ] || continue
+    rank=0; [ "$(tmux show-options -t "$name" -qv @hatch_mode 2>/dev/null)" = write ] && rank=1
+    if [ "$rank" -gt "$best_rank" ] || { [ "$rank" -eq "$best_rank" ] && [ "$created" -gt "$best_created" ]; }; then
+      best="$name"; best_rank="$rank"; best_created="$created"
+    fi
+  done <<EOF_SESSIONS
+$(tmux list-sessions -F '#{session_name} #{session_created} #{session_path}' 2>/dev/null)
+EOF_SESSIONS
+  [ -n "$best" ] && printf '%s' "$best"
+  return 0
+}

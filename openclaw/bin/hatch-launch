@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start a hatch session from OpenClaw, one task per session (no popup).
-#   hatch-launch [--host <ssh-host>] [--slug <slug>] [--expect "<what the report must show>"] [--readonly] [--reuse] [--worktree] [--force] \
+#   hatch-launch [--host <ssh-host>] [--slug <slug>] [--expect "<what the report must show>"] [--readonly] [--reuse] [--worktree] [--branch <name>] [--force] \
 #                <claude|codex> <dir> "<instructions>"
 #   --slug     task identifier (derived from the instructions if omitted); keys the session name, out dir and ledger
 #   --expect   what this task must prove, kept in the ledger (defaults to the start of the instructions)
@@ -11,7 +11,9 @@
 #   --reuse    if a session for the same dir exists, send the instructions there instead of starting one (old behaviour)
 #   --any-dir  allow launching outside a git repository (by default, outside a repository or in a parent of several is refused)
 #   --no-ledger do not write the ledger (added automatically on the remote side of --host)
-#   --worktree create a git worktree (~/.agents/worktrees/<repo>-<slug>, branch hatch/<slug>) and launch there.
+#   --worktree create (or reuse) a git worktree and launch there, in the same place as hatch's prefix+W:
+#              @hatch_worktree_dir/<branch>, defaulting to <repo>-wt/<branch> next to the repository.
+#              The branch is the slug unless --branch <name> is given (--branch implies --worktree).
 #              Only when the user asks for a worktree
 # The agent is told to write <out>/report.md when done.
 #   out = ~/.agents/out/<YYYYmmdd-HHMMSS>-<slug>/ on the host the agent runs on; meta.json holds the launch info
@@ -21,7 +23,7 @@ set -uo pipefail
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 HATCH_NO_DISPATCH=1 . "$here/_remote.sh"
 
-host="${HATCH_HOST:-}"; slug=""; expect=""; reuse=""; worktree=""; noledger=""; readonly=""; force=""; anydir=""
+host="${HATCH_HOST:-}"; slug=""; expect=""; reuse=""; worktree=""; noledger=""; readonly=""; force=""; anydir=""; branch=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --host) host="$2"; shift 2 ;;
@@ -29,6 +31,7 @@ while [ $# -gt 0 ]; do
   --expect) expect="$2"; shift 2 ;;
   --reuse) reuse=1; shift ;;
   --worktree) worktree=1; shift ;;
+  --branch) branch="$2"; worktree=1; shift 2 ;;
   --readonly) readonly=1; shift ;;
   --force) force=1; shift ;;
   --any-dir) anydir=1; shift ;;
@@ -61,6 +64,7 @@ if [ -n "$host" ]; then
   case "$path" in "$HOME"/*) path="~${path#"$HOME"}" ;; "$HOME") path="~" ;; esac
   args=(--no-ledger --slug "$slug" --expect "$expect"); [ -n "$reuse" ] && args+=(--reuse); [ -n "$worktree" ] && args+=(--worktree)
   [ -n "$readonly" ] && args+=(--readonly); [ -n "$force" ] && args+=(--force); [ -n "$anydir" ] && args+=(--any-dir)
+  [ -n "$branch" ] && args+=(--branch "$branch")
   out="$(hatch_remote_cmd "$host" hatch-launch "${args[@]}" "$agent" "$path" "$prompt")" || { printf '%s\n' "$out"; exit 1; }
   printf '%s\n' "$out"
   line="$(printf '%s\n' "$out" | grep -m1 '^session=')"
@@ -104,14 +108,21 @@ if [ -n "$reuse" ]; then
   fi
 fi
 
-# --worktree
+# --worktree: the same place and rules as hatch's own prefix+W (scripts/worktree.sh), so either side finds
+# a worktree the other made: @hatch_worktree_dir/<branch>, defaulting to <repo>-wt/<branch> next to the repository.
 if [ -n "$worktree" ]; then
-  git -C "$path" rev-parse --show-toplevel >/dev/null 2>&1 || { echo "not a git repo: $path" >&2; exit 1; }
-  root="$(git -C "$path" rev-parse --show-toplevel)"
-  wt="$HOME/.agents/worktrees/$(basename "$root")-$slug"
+  root="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" || { echo "not a git repo: $path" >&2; exit 1; }
+  branch="${branch:-$slug}"
+  case "$branch" in -* | *..* | *' '*) echo "bad branch name: $branch" >&2; exit 2 ;; esac
+  wt="$(worktree_path "$root" "$branch")"
   if [ ! -d "$wt" ]; then
-    mkdir -p "$HOME/.agents/worktrees"
-    git -C "$root" worktree add -b "hatch/$slug" "$wt" >/dev/null 2>&1 || git -C "$root" worktree add "$wt" "hatch/$slug" >/dev/null 2>&1 || { echo "git worktree add failed" >&2; exit 1; }
+    mkdir -p "$(dirname "$wt")" 2>/dev/null
+    if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
+      wt_out="$(git -C "$root" worktree add "$wt" "$branch" 2>&1)"
+    else
+      wt_out="$(git -C "$root" worktree add -b "$branch" "$wt" 2>&1)"
+    fi
+    [ -d "$wt" ] || { echo "git worktree add failed: ${wt_out##*$'\n'}" >&2; exit 1; }
   fi
   path="$wt"
 fi

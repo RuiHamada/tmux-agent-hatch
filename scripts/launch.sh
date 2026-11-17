@@ -34,6 +34,13 @@ if is_hatch_session "$(tmux display-message -p '#S')"; then
   exit 0
 fi
 
+# No session of our own for this directory yet: if the OpenClaw bridge (openclaw/bin/hatch-launch) started
+# one here, open that instead of starting a second agent in the same place.
+if ! tmux has-session -t "$session" 2>/dev/null; then
+  delegated="$(delegated_session "$prefix" "$path")"
+  [ -n "$delegated" ] && session="$delegated"
+fi
+
 if ! tmux has-session -t "$session" 2>/dev/null; then
   [ -d "$path" ] || {
     tmux display-message "tmux-agent-hatch: $path no longer exists"

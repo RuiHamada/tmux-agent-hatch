@@ -32,10 +32,8 @@ esac
 root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
 [ -n "$root" ] || { msg "$dir is not inside a git repository"; exit 0; }
 
-repo="$(basename "$root")"
-base="$(get_tmux_option @hatch_worktree_dir '')"
-[ -n "$base" ] || base="$(dirname "$root")/$repo-wt"
-wt="$base/$branch"
+wt="$(worktree_path "$root" "$branch")"
+base="$(dirname "$wt")"
 
 if [ ! -d "$wt" ]; then
   mkdir -p "$base" 2>/dev/null
