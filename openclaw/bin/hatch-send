@@ -3,6 +3,8 @@
 #   hatch-send [--host <ssh-host>] <session> <text>      send text, then Enter
 #   hatch-send [--host <ssh-host>] <session> --key <Key>  send a tmux key name (Down / Up / Enter / Escape / C-c ...)
 # Sending just "y" or "1" answers permission prompts and questions.
+# Long or multi-line text goes in as one paste (tmux buffer, bracketed paste), so it arrives whole: typed
+# key by key, every newline would act as Enter and submit the message in pieces.
 set -uo pipefail
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
 target="${1:-}"; text="${2:-}"
@@ -11,7 +13,20 @@ tmux has-session -t "=$target" 2>/dev/null || tmux display-message -p -t "$targe
 if [ "$text" = --key ]; then
   key="${3:-}"; [ -n "$key" ] || { echo "usage: hatch-send <session> --key <Key>" >&2; exit 2; }
   tmux send-keys -t "$target" "$key"
+  exit $?
+fi
+case "$text" in
+*$'\n'*) paste=1 ;;
+*) paste=""; [ "${#text}" -gt 200 ] && paste=1 ;;
+esac
+if [ -n "$paste" ]; then
+  buf="hatch-send-$$"
+  printf '%s' "$text" | tmux load-buffer -b "$buf" - || { echo "tmux load-buffer failed" >&2; exit 1; }
+  # -p: bracketed paste when the application asked for it (Claude Code and Codex do); -d: drop the buffer afterwards
+  tmux paste-buffer -p -d -b "$buf" -t "$target" || { echo "tmux paste-buffer failed" >&2; exit 1; }
+  sleep "$(awk -v n="${#text}" 'BEGIN { s = 0.8 + n / 20000; if (s > 3) s = 3; print s }')"   # let the TUI take the paste in
+  tmux send-keys -t "$target" Enter
 else
-  # Type, wait a moment for the TUI to take the input, then Enter. Verified to go through with a single Enter.
+  # Short single-line text is typed (a one-key answer to a dialog must arrive as a key, not as a paste).
   tmux send-keys -t "$target" -l -- "$text" && sleep 0.5 && tmux send-keys -t "$target" Enter
 fi

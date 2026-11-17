@@ -2,14 +2,19 @@
 # Called from Claude Code / Codex hooks; POSTs a short notice to OpenClaw's /hooks/wake.
 # Does nothing without the config file (~/.openclaw/hatch-notify.env). Always exits 0 so the hook never blocks.
 #
-# How the source pane is found. TMUX_PANE may be stale under Codex's app-server daemon, so it is the
-# last resort.
-#   1. walk up the parent processes to a claude / codex process and take the pane owning its tty
+# How the source session is found. The notice is attributed to the exact tmux pane the agent runs in; the working
+# directory is only a fallback, because several sessions may share one directory.
+#   1. walk up the parent processes to a claude / codex process that owns a tty, and take the pane with that tty
 #   2. (codex) the sessionId in hatch-status/<pid>.json written by hooks/codex/status.sh -> pid -> tty -> pane
-#   3. a pane running claude / codex in the payload's cwd (several candidates: list them in the notice)
-#   4. TMUX_PANE, if that pane still exists
-# Targets are "claude / codex running inside a tmux pane" (the same rule as hatch-list), not session names.
-#
+#      (Codex runs hooks under its app-server daemon, which has no tty and may carry a stale TMUX_PANE)
+#   3. (claude) TMUX_PANE, if that pane exists and runs claude
+#   4. a pane running the agent in the payload's cwd (several candidates: listed, never guessed); not for SessionEnd
+#   5. TMUX_PANE, if that pane still exists
+# Not notified at all:
+#   - hooks fired by a child claude process of the session (no tty of its own: compaction, a headless run, ...);
+#     they are not the session's own turn, and their session id is not the conversation to resume
+#   - sessions whose ledger entry is closed (@hatch_closed) or that hatch-end is shutting down (@hatch_ending)
+#   - SessionEnd while the agent is in fact still running
 # What was sent or skipped, and the HTTP status, go to ~/.openclaw/hatch-notify.log (never the token or the body).
 set -uo pipefail
 env_file="${HATCH_NOTIFY_ENV:-$HOME/.openclaw/hatch-notify.env}"
@@ -35,7 +40,7 @@ Stop)              what="turn finished (idle)" ;;
 Notification)      what="waiting: permission prompt" ;;
 PreToolUse)        what="waiting: question for you" ;;
 PermissionRequest) what="waiting: permission prompt" ;;
-SessionEnd)        what="session ended" ;;
+SessionEnd)        what="session ended"; r="$(printf '%s' "$input" | jq -r '.reason // empty' 2>/dev/null)"; [ -n "$r" ] && what="session ended (reason: $r)" ;;
 '')                log "skip reason=no-event"; exit 0 ;;
 *)                 exit 0 ;;   # not a notified event (should not be registered); nothing to log
 esac
@@ -54,31 +59,51 @@ pane_by_tty() {  # <tty> → pane_id
 canon() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
 pane_alive() { [ -n "$1" ] && tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx -- "$1"; }  # display-message exits 0 even for a missing pane
 
-# 1. the agent from the parent chain (hooks run via bash/sh -c, so walk a few levels)
-apid=""; agent=""; pid="$PPID"
-for _ in 1 2 3 4 5 6; do
+# 1. the agent from the parent chain (hooks run via bash/sh -c, so walk up). The nearest agent process may be a
+#    child of the session's agent without a tty of its own; keep walking to the one that owns the pane.
+apid=""; agent=""; first=""; pane=""; by=""; candidates=""; pid="$PPID"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null || break
-  agent="$(agent_kind "$pid")"
-  if [ -n "$agent" ]; then apid="$pid"; break; fi
+  k="$(agent_kind "$pid")"
+  if [ -n "$k" ]; then
+    if [ -z "$first" ]; then first="$pid"; agent="$k"; fi
+    t="$(tty_of "$pid")"
+    if [ -n "$t" ]; then
+      pane="$(pane_by_tty "$t")"
+      if [ -n "$pane" ]; then apid="$pid"; by="chain-tty"; break; fi
+    fi
+  fi
   pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
 done
-pane=""; by=""; candidates=""
-if [ -n "$apid" ]; then
-  t="$(tty_of "$apid")"
-  [ -n "$t" ] && pane="$(pane_by_tty "$t")" && [ -n "$pane" ] && by="chain-tty"
-fi
+# A claude process without a tty is a child of some session's claude, not the session itself.
+nested=""
+[ "$agent" = claude ] && [ -n "$first" ] && [ -z "$(tty_of "$first")" ] && nested=1
+apid="${apid:-$first}"
+
+pane_runs() {   # <pane_id> <kind>: the pane's process or one of its children is that agent
+  local pp c
+  pp="$(tmux display-message -p -t "$1" '#{pane_pid}' 2>/dev/null)"; [ -n "$pp" ] || return 1
+  [ "$(agent_kind "$pp")" = "$2" ] && return 0
+  for c in $(pgrep -P "$pp" 2>/dev/null); do [ "$(agent_kind "$c")" = "$2" ] && return 0; done
+  return 1
+}
 # 2. codex: the pid status.sh already resolved (looked up by sessionId)
-if [ -z "$pane" ] && [ -n "$sid" ]; then
+if [ -z "$pane" ] && [ -n "$sid" ] && [ "$agent" != claude ]; then
   for f in "${CODEX_HOME:-$HOME/.codex}"/hatch-status/*.json; do
     [ -f "$f" ] || continue
     [ "$(jq -r '.sessionId // empty' "$f" 2>/dev/null)" = "$sid" ] || continue
     spid="${f##*/}"; spid="${spid%.json}"
     t="$(tty_of "$spid")"
-    [ -n "$t" ] && pane="$(pane_by_tty "$t")" && [ -n "$pane" ] && { by="status-file"; agent="${agent:-codex}"; break; }
+    [ -n "$t" ] && pane="$(pane_by_tty "$t")" && [ -n "$pane" ] && { by="status-file"; agent="${agent:-codex}"; apid="$spid"; break; }
   done
 fi
-# 3. a pane running claude/codex whose cwd matches
-if [ -z "$pane" ] && [ -n "$cwd" ]; then
+# 3. claude: TMUX_PANE is inherited from the session's own claude and is exact, as long as that pane still runs claude
+if [ -z "$pane" ] && [ "$agent" = claude ] && pane_alive "${TMUX_PANE:-}" && pane_runs "$TMUX_PANE" claude; then
+  pane="$TMUX_PANE"; by="TMUX_PANE-claude"
+fi
+# 4. a pane running the agent whose cwd matches. Not for SessionEnd: when the session's own pane is already gone,
+#    a directory match can only find some other session that happens to work in the same place.
+if [ -z "$pane" ] && [ -n "$cwd" ] && [ "$event" != SessionEnd ]; then
   want="$(canon "$cwd")"
   while read -r ppid_ pane_ path_; do
     [ -n "$pane_" ] || continue
@@ -99,8 +124,8 @@ EOF_PANES
   *) pane="$candidates"; candidates=""; by="cwd" ;;
   esac
 fi
-# 4. last resort: TMUX_PANE
-if [ -z "$pane" ] && [ -z "$candidates" ] && pane_alive "${TMUX_PANE:-}"; then
+# 5. last resort: TMUX_PANE
+if [ -z "$pane" ] && [ -z "$candidates" ] && [ "$event" != SessionEnd ] && pane_alive "${TMUX_PANE:-}"; then
   pane="$TMUX_PANE"; by="TMUX_PANE"
 fi
 
@@ -121,14 +146,21 @@ else
   log "skip reason=no-pane event=$event agent=${agent:-?} apid=${apid:-none} tmux_pane=${TMUX_PANE:-} cwd=${cwd:-?}"
   exit 0
 fi
+if [ -n "$nested" ]; then
+  log "skip reason=nested-agent event=$event session=$session by=${by:-none} pid=$first (a child claude process of the session, not its own turn)"
+  exit 0
+fi
 log "resolve event=$event agent=$agent session=$session by=$by apid=${apid:-none} tmux_pane=${TMUX_PANE:-}"
 
 hostflag="${OPENCLAW_HATCH_HOST:+ $OPENCLAW_HATCH_HOST}"
-# For sessions started by hatch-launch, add whether report.md exists
+# For sessions started by hatch-launch, add the round and whether its report exists
 rep=""
 if [ -n "$pane" ]; then
   if [ "$(tmux show-options -t "$pane" -qv @hatch_ending 2>/dev/null)" = 1 ]; then
     log "skip reason=ending session=$session event=$event"; exit 0   # hatch-end is shutting this session down
+  fi
+  if [ "$(tmux show-options -t "$pane" -qv @hatch_closed 2>/dev/null)" = 1 ]; then
+    log "skip reason=closed session=$session event=$event"; exit 0   # the task is verified and closed; nothing to report
   fi
   outdir="$(tmux show-options -t "$pane" -qv @hatch_out 2>/dev/null)"
   if [ -n "$outdir" ]; then
@@ -139,20 +171,24 @@ if [ -n "$pane" ]; then
         && mv -f "$outdir/meta.json.tmp" "$outdir/meta.json"
     fi
     slug="$(tmux show-options -t "$pane" -qv @hatch_slug 2>/dev/null)"
-    # Without a report.md, save the final response (read-only sessions cannot write files, so this is their deliverable)
-    if [ ! -f "$outdir/report.md" ] && { [ "$event" = Stop ] || [ "$event" = SessionEnd ]; }; then
+    round="$(tmux show-options -t "$pane" -qv @hatch_round 2>/dev/null)"; round="${round:-1}"
+    rfile="$(tmux show-options -t "$pane" -qv @hatch_report 2>/dev/null)"; rfile="$outdir/${rfile:-report.md}"
+    # Without a report for this round, save the final response (read-only sessions cannot write files, so this
+    # is their deliverable)
+    if [ ! -f "$rfile" ] && { [ "$event" = Stop ] || [ "$event" = SessionEnd ]; }; then
       last="$(printf '%s' "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null)"
-      if [ -z "$last" ]; then
+      if [ -z "$last" ] && [ "$round" -le 1 ]; then
         tp="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)"
         [ -r "$tp" ] && last="$(jq -r 'select(.type=="assistant") | .message.content | if type=="array" then map(select(.type=="text")|.text)|join("\n") else . end' "$tp" 2>/dev/null | awk 'NF{buf=buf $0 "\n"} /^$/{ } END{printf "%s", buf}' | tail -c 20000)"
       fi
       if [ -n "$last" ]; then
-        { printf '# auto-captured final response (%s, %s)\n\n' "$session" "$(date '+%F %T')"; printf '%s\n' "$last"; } >"$outdir/report.md" 2>/dev/null \
-          && log "report auto-captured session=$session bytes=${#last}"
+        { printf '# auto-captured final response (%s, round %s, %s)\n\n' "$session" "$round" "$(date '+%F %T')"; printf '%s\n' "$last"; } >"$rfile" 2>/dev/null \
+          && log "report auto-captured session=$session round=$round bytes=${#last}"
       fi
     fi
-    if [ -f "$outdir/report.md" ]; then rep=" slug=$slug report=READY (hatch-report$hostflag $session)"
-    else rep=" slug=$slug report=MISSING (ask the agent to write $outdir/report.md, or read hatch-capture$hostflag $session)"; fi
+    rtag=""; [ "$round" -gt 1 ] 2>/dev/null && rtag=" round=$round"
+    if [ -f "$rfile" ]; then rep=" slug=$slug$rtag report=READY (hatch-report$hostflag $session)"
+    else rep=" slug=$slug$rtag report=MISSING (ask the agent to write $rfile, or read hatch-capture$hostflag $session)"; fi
   fi
 fi
 if [ -n "$rep" ]; then
@@ -165,6 +201,13 @@ body="$(jq -cn --arg t "$text" --arg a "${OPENCLAW_AGENT_ID:-main}" '{text:$t, m
 url="${OPENCLAW_HOOK_URL%/}/wake"
 # Send in the background so the hook is not delayed; log only the outcome (never the token or the body).
 (
+  if [ "$event" = SessionEnd ] && [ -n "$apid" ]; then
+    # "session ended" is only true once the agent is gone. Give it a moment, then look.
+    sleep "${HATCH_NOTIFY_END_WAIT:-3}"
+    if kill -0 "$apid" 2>/dev/null; then
+      log "skip reason=session-still-alive event=SessionEnd session=$session pid=$apid"; exit 0
+    fi
+  fi
   code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "$url" \
     -H "Authorization: Bearer $OPENCLAW_HOOK_TOKEN" -H 'Content-Type: application/json' \
     --data "$body" 2>/dev/null)"; rc=$?

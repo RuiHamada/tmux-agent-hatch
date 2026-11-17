@@ -1,18 +1,46 @@
 #!/usr/bin/env bash
-# Read the report.md an agent wrote (results come from a file, not the screen).
-#   hatch-report [--host <ssh-host>] <session>        report.md in the session's out directory
-#   hatch-report [--host <ssh-host>] <out-dir>        an out directory given directly
-# Without a report.md, prints "no report yet" and exits 1 (the agent has not written it yet).
+# Read the report an agent wrote (results come from a file, not the screen).
+#   hatch-report [--host <ssh-host>] [--round <N>] <session|slug>   the latest round's report (or round N)
+#   hatch-report [--host <ssh-host>] [--round <N>] <out-dir>        an out directory given directly
+# Tasks in the ledger are found through it, so a report stays readable after its session has ended.
+# Without a report, prints "no report yet" and exits 1 (the agent has not written it yet).
 set -uo pipefail
-. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
-target="${1:-}"; [ -n "$target" ] || { echo "usage: hatch-report <session|out-dir>" >&2; exit 2; }
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+HATCH_NO_DISPATCH=1 . "$here/_remote.sh"
+host="${HATCH_HOST:-}"; round=""; direct=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --host) host="$2"; shift 2 ;;
+  --round) round="$2"; shift 2 ;;
+  --direct) direct=1; shift ;;   # internal: already on the right host, <out-dir> given
+  -*) echo "unknown option: $1" >&2; exit 2 ;;
+  *) break ;;
+  esac
+done
+target="${1:-}"; [ -n "$target" ] || { echo "usage: hatch-report [--host H] [--round N] <session|slug|out-dir>" >&2; exit 2; }
+show() {   # <out-dir> [round]: print that round's report, or the newest one
+  local out="$1" r="${2:-}" f=""
+  if [ -n "$r" ]; then f="$out/report.md"; [ "$r" -gt 1 ] && f="$out/report-$r.md"
+  else f="$(ls -1 "$out"/report-*.md 2>/dev/null | sort -t- -k2 -n | tail -1)"; [ -n "$f" ] || f="$out/report.md"; fi
+  if [ -f "$f" ]; then echo "# report: $f ($(date -r "$f" '+%m-%d %H:%M'))"; cat "$f"
+  else echo "no report yet: $f"; return 1; fi
+}
+if [ -n "$direct" ]; then show "${target/#\~/$HOME}" "$round"; exit $?; fi
 case "$target" in
-/*|~*) out="${target/#\~/$HOME}" ;;
-*) out="$(tmux show-options -t "$target" -qv @hatch_out 2>/dev/null)"
-   [ -n "$out" ] || { echo "session $target has no out dir (not launched by hatch-launch?)" >&2; exit 1; } ;;
+/*|~*) out="$target"; rhost="${host:-local}" ;;
+*)
+  if [ -z "$host" ] || [ -f "${HATCH_LEDGER:-$HOME/.openclaw/hatch-ledger.tsv}" ]; then
+    row="$(HATCH_NO_REAP=1 "$here/hatch-ledger" lookup "$target" ${host:+"$host"} 2>/dev/null)" || row=""
+  fi
+  if [ -n "${row:-}" ]; then
+    IFS=$'\t' read -r rhost _ _ _ out _ <<<"$row"
+  else
+    # Not in the ledger (e.g. called on the agent's host): ask tmux
+    rhost="${host:-local}"
+    if [ "$rhost" = local ]; then out="$(tmux show-options -t "$target" -qv @hatch_out 2>/dev/null)"
+    else out="$(hatch_remote_cmd "$rhost" tmux show-options -t "$target" -qv @hatch_out 2>/dev/null)"; fi
+    [ -n "$out" ] || { echo "$target is not in the ledger and has no live hatch session" >&2; exit 1; }
+  fi ;;
 esac
-if [ -f "$out/report.md" ]; then
-  echo "# report: $out/report.md ($(date -r "$out/report.md" '+%m-%d %H:%M'))"; cat "$out/report.md"
-else
-  echo "no report yet: $out/report.md"; exit 1
-fi
+if [ "$rhost" = local ]; then show "${out/#\~/$HOME}" "$round"
+else hatch_remote_cmd "$rhost" hatch-report --direct ${round:+--round "$round"} "$out"; fi

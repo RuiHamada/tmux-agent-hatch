@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # End sessions whose ledger entry is closed. Applied mechanically; safe to run any time.
 #   hatch-reap [--grace-min <N>] [--dry-run]
-#   read-only session, closed          -> ended now (its deliverable is report.md)
+#   read-only session, closed          -> ended now (its deliverable is the report)
 #   writer session, closed             -> ended once it has been closed for N minutes (default 120,
 #                                         or HATCH_REAP_GRACE_MIN) and the agent is not working or waiting
 #   open ledger entry / not in ledger  -> never touched
-# Runs in the background from hatch-launch and hatch-ledger list/close, so no daemon is needed.
+# A session's state is its latest ledger row (a task continued with hatch-launch --continue is open again).
+# hatch-ledger close ends read-only sessions itself; this sweep covers writers past their grace period and
+# anything a failed close left behind. It is started (detached) by hatch-launch and hatch-ledger list/close.
 set -uo pipefail
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 LEDGER="${HATCH_LEDGER:-$HOME/.openclaw/hatch-ledger.tsv}"
@@ -21,23 +23,28 @@ done
 . "$here/_alive.sh"
 alive="$(hatch_alive_pairs "$LEDGER" | paste -sd"|" -)"   # one line: BSD awk rejects newlines in -v
 now="$(date +%s)"
-# closed rows whose session still exists: host agent session closed_at
-awk -F'\t' -v alive="$alive" 'BEGIN { n = split(alive, a, "|"); for (i = 1; i <= n; i++) up[a[i]] = 1 }
-  NR > 1 && $7 == "closed" && (($2 "/" $4) in up) { print $2, $3, $4, ($10 == "" ? 0 : $10) }' "$LEDGER" |
-while read -r host agent session closed_at; do
+# Latest row per host/session; keep the closed ones whose session still exists: host agent session closed_at
+rows="$(awk -F'\t' -v alive="$alive" 'BEGIN { n = split(alive, a, "|"); for (i = 1; i <= n; i++) up[a[i]] = 1 }
+  NR > 1 { k = $2 "/" $4; if (!(k in seen)) order[++m] = k; seen[k] = 1; st[k] = $7; ag[k] = $3; ca[k] = ($10 == "" ? 0 : $10) }
+  END { for (i = 1; i <= m; i++) { k = order[i]; if (st[k] == "closed" && (k in up)) { split(k, p, "/"); print p[1], ag[k], substr(k, length(p[1]) + 2), ca[k] } } }' "$LEDGER")"
+# Read the rows on fd 3 so that nothing run inside the loop can consume them.
+while read -r host agent session closed_at <&3; do
+  [ -n "$session" ] || continue
   hostargs=(); [ "$host" = local ] || hostargs=(--host "$host")
   case "$agent" in
   */ro) why="read-only, closed" ;;
   *)
     mins=$(( (now - closed_at) / 60 ))
     [ "$mins" -ge "$grace" ] || continue
-    # hatch-list: agent status age location path session slug mode
-    st="$(HATCH_NO_REAP=1 "$here/hatch-list" ${hostargs[@]+"${hostargs[@]}"} 2>/dev/null | awk -F'\t' -v s="$session" '$6 == s { print $2; exit }')"
+    # hatch-list: agent status age location path session ...
+    st="$(HATCH_NO_REAP=1 "$here/hatch-list" ${hostargs[@]+"${hostargs[@]}"} 2>/dev/null </dev/null | awk -F'\t' -v s="$session" '$6 == s { print $2; exit }')"
     case "$st" in working|waiting) continue ;; esac
     why="writer, closed ${mins}m ago" ;;
   esac
   if [ -n "$dry" ]; then echo "would end: $host/$session ($why)"; continue; fi
-  if HATCH_NO_REAP=1 "$here/hatch-end" ${hostargs[@]+"${hostargs[@]}"} "$session" >/dev/null 2>&1; then echo "ended: $host/$session ($why)"
+  if HATCH_NO_REAP=1 "$here/hatch-end" ${hostargs[@]+"${hostargs[@]}"} "$session" >/dev/null 2>&1 </dev/null; then echo "ended: $host/$session ($why)"
   else echo "could not end: $host/$session" >&2; fi
-done
+done 3<<EOF_ROWS
+$rows
+EOF_ROWS
 exit 0

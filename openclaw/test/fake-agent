@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Stand-in for claude / codex in tests: records how it was started, writes the report named in the prompt,
+# then keeps reading follow-up messages (as a TUI would) and treats each one the same way.
+log="${HATCH_FAKE_LOG:-/dev/null}"
+printf 'ARGV: %s\n' "$*" >>"$log"
+handle() {
+  local rep
+  rep="$(printf '%s' "$1" | grep -oE '/[^ ]*/report(-[0-9]+)?\.md' | tail -1)"
+  printf 'MSG-BEGIN\n%s\nMSG-END\n' "$1" >>"$log"
+  [ -n "$rep" ] && printf '## Summary\nfake report for %s\n' "$(basename "$rep")" >"$rep"
+  return 0
+}
+[ $# -gt 0 ] && handle "${!#}"
+buf=""
+while :; do
+  if IFS= read -r -t 2 line; then buf="$buf$line
+"
+  elif [ -n "$buf" ]; then handle "${buf%$'\n'}"; buf=""
+  fi
+done

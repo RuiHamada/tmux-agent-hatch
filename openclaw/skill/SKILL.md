@@ -1,6 +1,6 @@
 ---
 name: hatch
-description: Start, watch and drive Claude Code / Codex in tmux (tmux-agent-hatch) on this Mac and on the workstation. When asked for coding work, do not write code yourself; launch one session per task with hatch-launch, read the agent's report.md with hatch-report when the completion notice arrives, and close the task in hatch-ledger.
+description: Start, watch and drive Claude Code / Codex in tmux (tmux-agent-hatch) on this Mac and on the workstation. When asked for coding work, do not write code yourself; launch one session per task with hatch-launch, send fix rounds to the same session with --continue, read the agent's report with hatch-report when the completion notice arrives, and close the task in hatch-ledger.
 ---
 
 # hatch: Claude Code / Codex in tmux, driven from the front door
@@ -20,20 +20,22 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
 
 | Command | Purpose |
 |---|---|
-| `hatch-launch [--slug <slug>] [--expect "<what to verify>"] <claude\|codex> <dir> "<instructions>"` | Start an implementation task (a writer) in a new session. slug is the task name (e.g. `fix-login-500`). The agent is told to write report.md when done. Note `session=` `slug=` `out=` from the output. A ledger row is added automatically |
+| `hatch-launch [--slug <slug>] [--expect "<what to verify>"] [--model <name>] [--effort <level>] <claude\|codex> <dir> "<instructions>"` | Start an implementation task (a writer) in a new session. slug is the task name (e.g. `fix-login-500`). The agent is told to write report.md when done. Note `session=` `slug=` `out=` from the output. A ledger row is added automatically |
+| `hatch-launch --continue <session\|slug> [--expect "<what this round must show>"] "<instructions>"` | A follow-up round for an existing task **in the same agent conversation**: fix rounds after a review, a correction, "also do X". If the session is alive the instructions are sent to it; if it has ended, the saved conversation is resumed in a new tmux session of the same name. Opens a new ledger round (the task is open again) and the round writes `report-<N>.md`. The host comes from the ledger; no `--host`, agent or dir needed |
 | `hatch-launch --readonly ...` | Investigation / review. Claude runs in plan mode, Codex in a read-only sandbox; files cannot be changed. The final response is saved as report.md automatically. May run alongside a writer in the same dir |
 | `hatch-launch --worktree ...` | Create (or reuse) a git worktree and launch there. Same place as the user's own prefix+W: `<repo>-wt/<branch>` next to the repository; the branch is the slug, or `--branch <name>`. **Only when the user asks for a worktree** |
-| `hatch-launch --reuse ...` | Old behaviour: send the instructions to the existing session for the same dir. **Only for a follow-up of the same task** |
-| `hatch-report <session>` | Read the agent's report.md (Summary / Changed / Validation / Handoff). Prints "no report yet" if absent |
+| `--model <name>` / `--effort <level>` | Model and reasoning effort **for this launch only** (also accepted by `--continue`; a continued task keeps its values unless given). Never set the tmux options `@codex_args` / `@claude_args` for this: they are global, race between overlapping launches, and change the user's own popups |
+| `hatch-launch --reuse ...` | Send the instructions to the user's own popup session for the dir (the one prefix+y opens). Rarely what you want; for a task you started, use `--continue` |
+| `hatch-report [--round <N>] <session\|slug>` | Read the agent's report for the latest round, or round N (Summary / Changed / Validation / Handoff). Works after the session has ended. Prints "no report yet" if absent |
 | `hatch-ledger list` | Open tasks: age, host, session, slug, expect, note. `--all` adds closed tasks and whether each session is still alive |
 | `hatch-ledger show <session\|slug>` | One task in detail (expect = what must be verified) |
-| `hatch-ledger close <session\|slug> "<what was verified>"` | Close after verifying the report. A read-only session is ended right away; a writer session 2 hours later if idle |
+| `hatch-ledger close <session\|slug> "<what was verified>"` | Close after verifying the report. A read-only session is ended before the command returns (it prints `ended: <session>`); a writer session stays for 2 hours so it can be continued, then is ended if idle |
 | `hatch-end <session>` | End a session now (kills the tmux session and its agent). Refused while the ledger entry is open. Use when the user says the work is finished and does not want to wait for the grace period |
 | `hatch-reap` | Apply the ending policy to all closed tasks. Runs by itself after `hatch-launch` and `hatch-ledger list/close`; run it on heartbeat too |
 | `hatch-ledger note <session\|slug> "<note>"` | Record progress (stays open) |
-| `hatch-list` | Running agents (TSV: agent, status, age, location, path, session, slug, mode). status is waiting / idle / busy / ?; mode is write / read |
+| `hatch-list` | Running agents (TSV: agent, status, age, location, path, session, slug, mode, round, model). status is waiting / idle / busy / ?; mode is write / read; model is `name/effort` |
 | `hatch-capture <session> [lines]` | The last N lines of the screen (default 60). For questions, permission prompts, and when there is no report |
-| `hatch-send <session> "<text>"` | Send follow-up instructions or answers to questions / permission prompts ("y", "1", ...), with Enter |
+| `hatch-send <session> "<text>"` | Send a short message or an answer to a question / permission prompt ("y", "1", ...), with Enter. Long or multi-line text is pasted in one piece and arrives whole. For a new round of work prefer `--continue` (it opens the ledger round and the report) |
 | `hatch-send <session> --key <Key>` | Send a key instead of text: `Down` / `Up` / `Enter` / `Escape` / `C-c`. For selection dialogs |
 
 ## Choosing the dir (easy to get wrong, so first)
@@ -43,9 +45,10 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
 - Work on the same repository (an implementation and its review, an investigation and its fix) is launched in
   **the same dir**. Never run a review from the parent directory or from elsewhere. When unsure, match the dir of
   the earlier task (`hatch-ledger list`, then the `cwd` in `out/meta.json` of `hatch-ledger show`).
-- Only one writer (implementation) per dir. A second writer in the same dir is refused (`--worktree` to separate,
-  `--reuse` to send to the existing one, `--force` if the user accepts the risk). Read-only (`--readonly`) sessions
-  are unlimited.
+- Only one writer (implementation) per dir. A second writer in the same dir is refused, and the message says what to
+  do: `--continue <that session>` when the new work is a follow-up of its task (also when that task is already
+  closed and waiting out its grace period), `hatch-end <that session>` to free the directory, `--worktree` to
+  separate, `--force` if the user accepts the risk. Read-only (`--readonly`) sessions are unlimited.
 - A subdirectory of a monorepo is fine (anything inside the repository passes).
 - With `--host`, dir is a path on that host. `~/repos/xxx` works (it is resolved against the remote home even if the local shell expanded it).
 
@@ -55,15 +58,23 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
    `hatch-launch --slug <slug> --expect "<what the report must show>" ...`.
    If the request contains several independent pieces of work, launch each with its own slug (do not pile them
    onto one session). Investigation, review and consultation get `--readonly`.
+   Choose `--model` / `--effort` per launch when the user asked for a particular model or depth.
+   **Review and fix cycle:** each review is a fresh `--readonly` session (a reviewer should not carry the author's
+   context); each fix round goes back to the implementation session with `--continue <its session>`, so the agent
+   that wrote the code keeps its design intent. Do not start a new writer session for a fix round.
    Tell the user the session name and slug, and that it can be opened from the terminal: the picker (prefix+u), or
    prefix+y / prefix+Y in a pane of that directory, which opens this session as a popup.
 2. **Wait.** No polling: when the agent finishes or needs input, a notification (wake) arrives:
-   `[hatch] <agent> <session> on <host>: ... slug=<slug> report=READY|MISSING`.
+   `[hatch] <agent> <session> on <host>: ... slug=<slug> [round=<N>] report=READY|MISSING`.
+   It names the exact session. Closed tasks send nothing, and "session ended" is sent only when the agent has
+   really exited. A notice reading `one of [A,B]` means the session could not be identified; check both with `hatch-list`.
 3. **On a notification**
    - `hatch-ledger show <session>` to reread what this task must prove (expect).
    - If `report=READY`, read `hatch-report <session>`. Check that Validation contains actual results and that
      Handoff leaves nothing unfinished, against expect. If something is missing, push back with
-     `hatch-send <session> "verify <the missing point> and update report.md"` and do not close.
+     `hatch-send <session> "verify <the missing point> and update the report"` and do not close.
+     If the task is already closed and more work is needed (a review found problems), use
+     `hatch-launch --continue <session> --expect "<what the fix must show>" "<the findings to fix>"`.
    - If `report=MISSING`, look with `hatch-capture <session> 80`; if the work is done, `hatch-send <session> "write report.md"`.
    - Once verified, `hatch-ledger close <session> "<what was verified>"` and report the essentials to the user
      (changes, verification results, open issues).

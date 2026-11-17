@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # List the agents hatch knows about as TSV (same data source as the picker).
-#   agent  status  age  location  path  session
+#   agent  status  age  location  path  session  slug  mode  round  model(name/effort)
 # status: waiting (needs input) / idle (done, your turn) / busy (working) / ? (unknown)
 set -uo pipefail
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
 DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../scripts" && pwd)"
-printf 'agent\tstatus\tage\tlocation\tpath\tsession\tslug\tmode\n'
+printf 'agent\tstatus\tage\tlocation\tpath\tsession\tslug\tmode\tround\tmodel\n'
 "$DIR/agents.sh" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' |
   awk -F'\t' '{
     status = $6; sub(/^● */, "", status); gsub(/ +$/, "", status)
@@ -14,5 +14,7 @@ printf 'agent\tstatus\tage\tlocation\tpath\tsession\tslug\tmode\n'
     printf "%s\t%s\t%s\t%s\t%s\t%s\t", $5, status, age, loc, $9, sess
     cmd = "tmux show-options -t \"" sess "\" -qv @hatch_slug 2>/dev/null"; slug = ""; cmd | getline slug; close(cmd)
     cmd = "tmux show-options -t \"" sess "\" -qv @hatch_mode 2>/dev/null"; mode = ""; cmd | getline mode; close(cmd)
-    print (slug == "" ? "-" : slug) "\t" (mode == "" ? "-" : mode)
+    cmd = "tmux show-options -t \"" sess "\" -qv @hatch_round 2>/dev/null"; rnd = ""; cmd | getline rnd; close(cmd)
+    cmd = "tmux show-options -t \"" sess "\" -qv @hatch_model 2>/dev/null"; mdl = ""; cmd | getline mdl; close(cmd)
+    print (slug == "" ? "-" : slug) "\t" (mode == "" ? "-" : mode) "\t" (rnd == "" ? "-" : rnd) "\t" (mdl == "" ? "-" : mdl)
   }'
