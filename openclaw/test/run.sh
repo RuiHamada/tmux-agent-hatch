@@ -165,5 +165,56 @@ check "SessionEnd while the agent is still running: no notice" '[ "$(grep -c "" 
 tmux set-option -t claude-zzt-na @hatch_closed 1; fire na stop
 check "closed task: no notice"                         '[ "$(grep -c "" "$BODY")" -eq "$n0" ] && grep -q "skip reason=closed session=claude-zzt-na" "$NLOG"'
 
+echo "== hatch-notify: agent that changed directory, and agents that are in no tmux session"
+# Hooks fired from outside every pane, without TMUX_PANE: a daemonized process with no agent above it (as Codex's
+# app-server runs them), and a process named claude on a pty that is no tmux pane (a Claude Code background session).
+REPO2="$W/repo2"; mkdir -p "$REPO2/pkg/deep" "$REPO2/other/deep" "$REPO/sub" "$W/plain/sub" "$W/reg"
+git -C "$REPO2" init -q
+tmux new-session -d -s claude-zzt-nc -c "$REPO2" "$W/claude $W/pane.sh nc"
+tmux new-session -d -s claude-zzt-nd -c "$REPO2/pkg" "$W/claude $W/pane.sh nd"
+tmux new-session -d -s claude-zzt-ne -c "$W/plain" "$W/claude $W/pane.sh ne"
+waitfor '[ "$(tmux display-message -p -t claude-zzt-nd "#{pane_current_path}")" = "$REPO2/pkg" ]'
+stopjson() { printf '{"hook_event_name":"%s","cwd":"%s","session_id":"x","last_assistant_message":"m"}' "${2:-Stop}" "$1"; }
+detached() {   # <cwd> [event]: no agent in the parent chain, no tty, no TMUX_PANE
+  stopjson "$@" >"$W/d.json"
+  env -u TMUX_PANE -u TMUX HATCH_NOTIFY_ENV="$W/notify.env" python3 -c '
+import os, sys, time
+if os.fork(): os._exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+time.sleep(0.3)
+os.dup2(os.open(sys.argv[2], os.O_RDONLY), 0)
+os.execv(sys.argv[1], [sys.argv[1]])' "$BIN/hatch-notify" "$W/d.json"
+  sleep 2
+}
+last() { tail -n 1 "$BODY"; }
+n0="$(grep -c "" "$BODY")"; detached "$REPO2/other/deep"
+check "cwd in a subdirectory, empty TMUX_PANE: attributed to the session" '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && last | grep -q "claude claude-zzt-nc on" && grep -q "session=claude-zzt-nc by=cwd-ancestor .*tmux_pane=\$" "$NLOG"'
+detached "$REPO2/pkg/deep"
+check "one session directory inside another: the nearest wins" 'last | grep -q "claude claude-zzt-nd on"'
+detached "$REPO2"
+check "exact directory still resolves to its own session"       'last | grep -q "claude claude-zzt-nc on"'
+detached "$REPO/sub"
+check "two sessions at the same depth: listed, not guessed"     'last | grep -q "one of \[claude-zzt-n[ab],claude-zzt-n[ab]\]"'
+n0="$(grep -c "" "$BODY")"; detached "$W/plain/sub"
+check "ancestor outside a git work tree is not a match; the wake says not identified" '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && last | grep -q "(session not identified) on .*cwd=$W/plain/sub" && ! last | grep -q zzt-ne && grep -q "unattributed reason=no-pane" "$NLOG"'
+n0="$(grep -c "" "$BODY")"; detached "$W/plain/sub" SessionEnd
+check "SessionEnd that matches no session: logged, no notice"   '[ "$(grep -c "" "$BODY")" -eq "$n0" ] && grep -q "skip reason=no-pane event=SessionEnd" "$NLOG"'
+offtmux() {   # <cwd>: a claude process on its own pty (no pane), registered as a background session
+  stopjson "$1" >"$W/o.json"
+  env -u TMUX_PANE -u TMUX HATCH_NOTIFY_ENV="$W/notify.env" HATCH_CLAUDE_SESSIONS="$W/reg" python3 -c '
+import os, pty, sys
+pid, fd = pty.fork()
+if pid == 0: os.execv(sys.argv[1], ["claude", "-c", sys.argv[2]])
+try:
+    while os.read(fd, 4096): pass
+except OSError: pass
+os.waitpid(pid, 0)' "$W/claude" "printf '{\"kind\":\"bg\",\"name\":\"bg job\"}' >$W/reg/\$\$.json; $BIN/hatch-notify <$W/o.json; sleep 0.5"
+  sleep 2
+}
+n0="$(grep -c "" "$BODY")"; offtmux "$REPO2/other"
+check "background claude (own pty, no pane): not handed to the session in that directory" '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && ! last | grep -q "zzt-nc"'
+check "its wake names it and the cwd"                           'last | grep -q "claude background session ..bg job.. (pid [0-9]*, not in a tmux session) on .*turn finished.*cwd=$REPO2/other\." && grep -q "unattributed reason=not-in-tmux" "$NLOG"'
+
 echo; echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

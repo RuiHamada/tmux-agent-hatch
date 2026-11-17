@@ -142,8 +142,11 @@ Tried in order:
 
 1. Walk up the hook's parent processes to a `claude` / `codex` process and take the pane that owns its tty
 2. (Codex) the `sessionId` in `~/.codex/hatch-status/<pid>.json` written by `hooks/codex/status.sh` → pid → tty → pane
-3. A pane running `claude` / `codex` in the payload's `cwd`. With several candidates none is chosen; the session
-   names are listed in the notification
+3. A pane running `claude` / `codex` in the payload's `cwd`, or in an ancestor of it inside the same git work tree
+   (the agent may have changed into a subdirectory; the pane keeps the directory it started in). The nearest
+   directory wins. With several candidates at that depth none is chosen; the session names are listed in the
+   notification. Outside a git work tree only the exact directory matches, so a session in `$HOME` does not claim
+   everything below it
 4. `TMUX_PANE`, if it still points at an existing pane
 
 For Claude, `TMUX_PANE` is used before the directory match when that pane still runs claude: it is inherited from the
@@ -153,9 +156,18 @@ directory they used to be reported as "one of [A,B]"), sessions whose task is cl
 still running. `SessionEnd` is never attributed by directory: once the session's own pane is gone, a directory match can
 only point at some other session working in the same place.
 
+An agent whose own tty is not a tmux pane does not run in tmux: a Claude Code background session (it lives on a
+pty of Claude's daemon, `kind: "bg"` in `~/.claude/sessions/<pid>.json`), or an agent started in a plain terminal.
+Steps 3 and 4 are not tried for it, because a directory match would hand its turns to an unrelated session in the
+same repository. Its Stop / waiting events are still sent, as
+`[hatch] claude background session "<name>" (pid <pid>, not in a tmux session) on <host>: ...`, and an event that
+matches no session at all is sent as `(session not identified)` with its `cwd`, so a finished turn is never
+invisible. `OPENCLAW_HATCH_UNATTRIBUTED=0` in `hatch-notify.env` turns these two notices off (they are then only
+logged).
+
 Targets are "claude / codex running inside a tmux pane", the same rule as `hatch-list`, not session names
 (`claude-*` / `codex-*`). Agents in hand-made sessions (e.g. `graph-ws`) are notified too. When a notification
-does not arrive, read `~/.openclaw/hatch-notify.log` first (`skip reason=no-pane`: the pane could not be identified;
+does not arrive, read `~/.openclaw/hatch-notify.log` first (`unattributed reason=no-pane|not-in-tmux`: no session could be named and the notice said so;
 `send-failed http=... curl_exit=...`: the Gateway was not reached).
 
 ## Lessons from setup (2026-11-17, OpenClaw 2026.11.4)

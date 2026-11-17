@@ -8,8 +8,15 @@
 #   2. (codex) the sessionId in hatch-status/<pid>.json written by hooks/codex/status.sh -> pid -> tty -> pane
 #      (Codex runs hooks under its app-server daemon, which has no tty and may carry a stale TMUX_PANE)
 #   3. (claude) TMUX_PANE, if that pane exists and runs claude
-#   4. a pane running the agent in the payload's cwd (several candidates: listed, never guessed); not for SessionEnd
+#   4. a pane running the agent in the payload's cwd, or in an ancestor of it inside the same git work tree (the
+#      agent may have changed into a subdirectory); the nearest directory wins, several candidates at that depth
+#      are listed and never guessed; not for SessionEnd
 #   5. TMUX_PANE, if that pane still exists
+# An agent that owns a tty which is no tmux pane does not run in tmux at all (a Claude Code background session
+# lives on a pty of its daemon, or the agent was started in a plain terminal). Steps 3-5 are not tried for it:
+# a directory match would hand its turns to an unrelated session that merely works in the same repository.
+# Its Stop / waiting events are still sent, labelled "not in a tmux session", and so are events that match no
+# session at all, so that a finished turn is never invisible (OPENCLAW_HATCH_UNATTRIBUTED=0 turns these off).
 # Not notified at all:
 #   - hooks fired by a child claude process of the session (no tty of its own: compaction, a headless run, ...);
 #     they are not the session's own turn, and their session id is not the conversation to resume
@@ -61,7 +68,7 @@ pane_alive() { [ -n "$1" ] && tmux list-panes -a -F '#{pane_id}' 2>/dev/null | g
 
 # 1. the agent from the parent chain (hooks run via bash/sh -c, so walk up). The nearest agent process may be a
 #    child of the session's agent without a tty of its own; keep walking to the one that owns the pane.
-apid=""; agent=""; first=""; pane=""; by=""; candidates=""; pid="$PPID"
+apid=""; agent=""; first=""; pane=""; by=""; candidates=""; offtmux=""; pid="$PPID"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null || break
   k="$(agent_kind "$pid")"
@@ -71,6 +78,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     if [ -n "$t" ]; then
       pane="$(pane_by_tty "$t")"
       if [ -n "$pane" ]; then apid="$pid"; by="chain-tty"; break; fi
+      # The session's own agent (not a tty-less child of it) on a tty that is no pane: it runs outside tmux.
+      if [ "$pid" = "$first" ]; then offtmux="$t"; break; fi
     fi
   fi
   pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
@@ -98,34 +107,44 @@ if [ -z "$pane" ] && [ -n "$sid" ] && [ "$agent" != claude ]; then
   done
 fi
 # 3. claude: TMUX_PANE is inherited from the session's own claude and is exact, as long as that pane still runs claude
-if [ -z "$pane" ] && [ "$agent" = claude ] && pane_alive "${TMUX_PANE:-}" && pane_runs "$TMUX_PANE" claude; then
+if [ -z "$pane" ] && [ -z "$offtmux" ] && [ "$agent" = claude ] && pane_alive "${TMUX_PANE:-}" && pane_runs "$TMUX_PANE" claude; then
   pane="$TMUX_PANE"; by="TMUX_PANE-claude"
 fi
 # 4. a pane running the agent whose cwd matches. Not for SessionEnd: when the session's own pane is already gone,
 #    a directory match can only find some other session that happens to work in the same place.
-if [ -z "$pane" ] && [ -n "$cwd" ] && [ "$event" != SessionEnd ]; then
-  want="$(canon "$cwd")"
+if [ -z "$pane" ] && [ -z "$offtmux" ] && [ -n "$cwd" ] && [ "$event" != SessionEnd ]; then
+  want="$(canon "$cwd")"; top=""; best=-1; exact=""
   while read -r ppid_ pane_ path_; do
     [ -n "$pane_" ] || continue
-    [ "$(canon "$path_")" = "$want" ] || continue
+    pc="$(canon "$path_")"
+    if [ "$pc" = "$want" ]; then :
+    else
+      # an ancestor counts only inside the same git work tree: a session in $HOME is not the owner of every
+      # directory below it
+      case "$want" in "${pc%/}"/*) ;; *) continue ;; esac
+      [ -n "$top" ] || top="$(git -C "$want" rev-parse --show-toplevel 2>/dev/null || echo -)"
+      [ "$top" != - ] && [ "$(git -C "$pc" rev-parse --show-toplevel 2>/dev/null)" = "$top" ] || continue
+    fi
     k="$(agent_kind "$ppid_")"
     if [ -z "$k" ]; then
       for c in $(pgrep -P "$ppid_" 2>/dev/null); do k="$(agent_kind "$c")"; [ -n "$k" ] && break; done
     fi
     [ -n "$k" ] || continue
     [ -n "$agent" ] && [ "$k" != "$agent" ] && continue
-    candidates="${candidates:+$candidates,}$pane_"; agent="${agent:-$k}"
+    if [ "${#pc}" -gt "$best" ]; then best="${#pc}"; candidates="$pane_"; ckind="$k"; exact=""; [ "$pc" = "$want" ] && exact=1
+    elif [ "${#pc}" -eq "$best" ]; then candidates="$candidates,$pane_"; fi
   done <<EOF_PANES
 $(tmux list-panes -a -F '#{pane_pid} #{pane_id} #{pane_current_path}' 2>/dev/null)
 EOF_PANES
+  [ -n "$candidates" ] && agent="${agent:-$ckind}"
   case "$candidates" in
   '') ;;
   *,*) by="cwd-ambiguous" ;;
-  *) pane="$candidates"; candidates=""; by="cwd" ;;
+  *) pane="$candidates"; candidates=""; by="cwd"; [ -n "$exact" ] || by="cwd-ancestor" ;;
   esac
 fi
 # 5. last resort: TMUX_PANE
-if [ -z "$pane" ] && [ -z "$candidates" ] && [ "$event" != SessionEnd ] && pane_alive "${TMUX_PANE:-}"; then
+if [ -z "$pane" ] && [ -z "$candidates" ] && [ -z "$offtmux" ] && [ "$event" != SessionEnd ] && pane_alive "${TMUX_PANE:-}"; then
   pane="$TMUX_PANE"; by="TMUX_PANE"
 fi
 
@@ -143,14 +162,36 @@ elif [ -n "$candidates" ]; then
   done
   where="one of [$session]"
 else
-  log "skip reason=no-pane event=$event agent=${agent:-?} apid=${apid:-none} tmux_pane=${TMUX_PANE:-} cwd=${cwd:-?}"
-  exit 0
+  session=""; where=""
 fi
 if [ -n "$nested" ]; then
-  log "skip reason=nested-agent event=$event session=$session by=${by:-none} pid=$first (a child claude process of the session, not its own turn)"
+  log "skip reason=nested-agent event=$event session=${session:-none} by=${by:-none} pid=$first (a child claude process of the session, not its own turn)"
   exit 0
 fi
-log "resolve event=$event agent=$agent session=$session by=$by apid=${apid:-none} tmux_pane=${TMUX_PANE:-}"
+unattributed=""
+if [ -z "$where" ]; then
+  # No tmux session to name. Say so in the log, and (for a turn that finished or waits) in a wake that names the cwd.
+  why="no-pane"; [ -n "$offtmux" ] && why="not-in-tmux"
+  if [ "$event" = SessionEnd ] || [ "${OPENCLAW_HATCH_UNATTRIBUTED:-1}" = 0 ]; then
+    log "skip reason=$why event=$event agent=${agent:-?} apid=${apid:-none} tty=${offtmux:-none} tmux_pane=${TMUX_PANE:-} cwd=${cwd:-?}"
+    exit 0
+  fi
+  unattributed=1; agent="${agent:-agent}"
+  if [ -n "$offtmux" ]; then
+    # Claude Code keeps a registry of its sessions by pid; use it for a name when it is there (best effort).
+    label="session"; reg="${HATCH_CLAUDE_SESSIONS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions}/$apid.json"
+    if [ "$agent" = claude ] && [ -r "$reg" ]; then
+      [ "$(jq -r '.kind // empty' "$reg" 2>/dev/null)" = bg ] && label="background session"
+      rn="$(jq -r '.name // empty' "$reg" 2>/dev/null)"; [ -n "$rn" ] && label="$label \"$rn\""
+    fi
+    where="$label (pid $apid, not in a tmux session)"
+  else
+    where="(session not identified)"
+  fi
+  log "unattributed reason=$why event=$event agent=$agent apid=${apid:-none} tty=${offtmux:-none} tmux_pane=${TMUX_PANE:-} cwd=${cwd:-?}"
+else
+  log "resolve event=$event agent=$agent session=$session by=$by apid=${apid:-none} tmux_pane=${TMUX_PANE:-}"
+fi
 
 hostflag="${OPENCLAW_HATCH_HOST:+ $OPENCLAW_HATCH_HOST}"
 # For sessions started by hatch-launch, add the round and whether its report exists
@@ -191,7 +232,11 @@ if [ -n "$pane" ]; then
     else rep=" slug=$slug$rtag report=MISSING (ask the agent to write $rfile, or read hatch-capture$hostflag $session)"; fi
   fi
 fi
-if [ -n "$rep" ]; then
+if [ -n "$unattributed" ]; then
+  if [ -n "$offtmux" ]; then hint="hatch-capture cannot read it."
+  else hint="No tmux session matched this directory; check hatch-list$hostflag."; fi
+  text="[hatch] $agent $where on $(hostname -s): $what. cwd=${cwd:-?}. $hint"
+elif [ -n "$rep" ]; then
   text="[hatch] $agent $where on $(hostname -s): $what.$rep cwd=${cwd:-?}."
 else
   text="[hatch] $agent $where on $(hostname -s): $what. cwd=${cwd:-?}. Use hatch-capture$hostflag <session> to read the screen."
@@ -212,9 +257,9 @@ url="${OPENCLAW_HOOK_URL%/}/wake"
     -H "Authorization: Bearer $OPENCLAW_HOOK_TOKEN" -H 'Content-Type: application/json' \
     --data "$body" 2>/dev/null)"; rc=$?
   if [ "$rc" -eq 0 ] && [ "$code" -ge 200 ] 2>/dev/null && [ "$code" -lt 300 ]; then
-    log "sent event=$event session=$session http=$code"
+    log "sent event=$event session=${session:-unattributed} http=$code"
   else
-    log "send-failed event=$event session=$session http=${code:-000} curl_exit=$rc url=$url"
+    log "send-failed event=$event session=${session:-unattributed} http=${code:-000} curl_exit=$rc url=$url"
   fi
 ) >/dev/null 2>&1 &
 exit 0

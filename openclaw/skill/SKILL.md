@@ -68,6 +68,10 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
    `[hatch] <agent> <session> on <host>: ... slug=<slug> [round=<N>] report=READY|MISSING`.
    It names the exact session. Closed tasks send nothing, and "session ended" is sent only when the agent has
    really exited. A notice reading `one of [A,B]` means the session could not be identified; check both with `hatch-list`.
+   A notice reading `background session "<name>" (pid ..., not in a tmux session)` comes from a Claude Code
+   background job or an agent outside tmux: it belongs to no hatch session, even if one works in the same
+   directory, and `hatch-capture` cannot read it; do not report it as that session's progress. A notice reading
+   `(session not identified)` names only the `cwd`; find the session with `hatch-list`.
 3. **On a notification**
    - `hatch-ledger show <session>` to reread what this task must prove (expect).
    - If `report=READY`, read `hatch-report <session>`. Check that Validation contains actual results and that
