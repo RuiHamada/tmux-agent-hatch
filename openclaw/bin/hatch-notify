@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Claude Code / Codex の hook から呼ばれ、OpenClaw の /hooks/wake に短い通知を送る。
-# 設定ファイル(~/.openclaw/hatch-notify.env)が無ければ何もしない。hook を止めないよう常に 0 で抜ける。
+# Called from Claude Code / Codex hooks; POSTs a short notice to OpenClaw's /hooks/wake.
+# Does nothing without the config file (~/.openclaw/hatch-notify.env). Always exits 0 so the hook never blocks.
 #
-# 通知元の画面(tmux pane)の決め方。TMUX_PANE は Codex の app-server daemon が古い値を
-# 引き継ぐことがあるので最後の手段にする。
-#   1. 親プロセスを辿って claude / codex のプロセスを見つけ、その tty を持つ pane
-#   2. (codex) hooks/codex/status.sh が書いた hatch-status/<pid>.json の sessionId から pid → tty → pane
-#   3. payload の cwd と同じディレクトリで claude / codex を動かしている pane(複数なら候補を列挙して通知)
-#   4. TMUX_PANE がまだ生きていればそれ
-# 対象はセッション名ではなく「tmux の pane の中で動いている claude / codex」(hatch の一覧と同じ基準)。
+# How the source pane is found. TMUX_PANE may be stale under Codex's app-server daemon, so it is the
+# last resort.
+#   1. walk up the parent processes to a claude / codex process and take the pane owning its tty
+#   2. (codex) the sessionId in hatch-status/<pid>.json written by hooks/codex/status.sh -> pid -> tty -> pane
+#   3. a pane running claude / codex in the payload's cwd (several candidates: list them in the notice)
+#   4. TMUX_PANE, if that pane still exists
+# Targets are "claude / codex running inside a tmux pane" (the same rule as hatch-list), not session names.
 #
-# 送った/送らなかった理由と HTTP ステータスは ~/.openclaw/hatch-notify.log に残す(token と本文は書かない)。
+# What was sent or skipped, and the HTTP status, go to ~/.openclaw/hatch-notify.log (never the token or the body).
 set -uo pipefail
 env_file="${HATCH_NOTIFY_ENV:-$HOME/.openclaw/hatch-notify.env}"
 [ -r "$env_file" ] || exit 0
@@ -18,7 +18,7 @@ env_file="${HATCH_NOTIFY_ENV:-$HOME/.openclaw/hatch-notify.env}"
 . "$env_file"
 LOG="${OPENCLAW_HATCH_LOG:-${env_file%/*}/hatch-notify.log}"
 log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$LOG" 2>/dev/null; return 0; }
-# 肥大化防止: 256KB を超えたら末尾 500 行だけ残す
+# Keep the log small: above 256KB keep only the last 500 lines
 if [ -f "$LOG" ] && [ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
   tail -n 500 "$LOG" >"$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
 fi
@@ -37,14 +37,14 @@ PreToolUse)        what="waiting: question for you" ;;
 PermissionRequest) what="waiting: permission prompt" ;;
 SessionEnd)        what="session ended" ;;
 '')                log "skip reason=no-event"; exit 0 ;;
-*)                 exit 0 ;;   # 通知対象外のイベント(登録していないはず)。記録不要
+*)                 exit 0 ;;   # not a notified event (should not be registered); nothing to log
 esac
 
-agent_kind() {   # <pid> → claude | codex | 空
+agent_kind() {   # <pid> -> claude | codex | empty
   local c; c="$(ps -o comm= -p "$1" 2>/dev/null)"
   case "${c##*/}" in claude*) echo claude ;; codex*) echo codex ;; esac
 }
-tty_of() {       # <pid> → "ttys003" / "pts/3"、無ければ空
+tty_of() {       # <pid> -> "ttys003" / "pts/3", empty if none
   local t; t="$(ps -o tty= -p "$1" 2>/dev/null | tr -d ' ')"
   case "$t" in '' | '?' | '??') ;; *) printf '%s' "$t" ;; esac
 }
@@ -52,9 +52,9 @@ pane_by_tty() {  # <tty> → pane_id
   tmux list-panes -a -F '#{pane_tty} #{pane_id}' 2>/dev/null | awk -v t="$1" '{ sub(/^\/dev\//, "", $1); if ($1 == t) { print $2; exit } }'
 }
 canon() { (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
-pane_alive() { [ -n "$1" ] && tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx -- "$1"; }  # display-message は無い pane でも 0 を返す
+pane_alive() { [ -n "$1" ] && tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx -- "$1"; }  # display-message exits 0 even for a missing pane
 
-# 1. 親プロセスの連鎖から agent を特定(hook は bash/sh -c 経由で呼ばれるので数段遡る)
+# 1. the agent from the parent chain (hooks run via bash/sh -c, so walk a few levels)
 apid=""; agent=""; pid="$PPID"
 for _ in 1 2 3 4 5 6; do
   [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null || break
@@ -67,7 +67,7 @@ if [ -n "$apid" ]; then
   t="$(tty_of "$apid")"
   [ -n "$t" ] && pane="$(pane_by_tty "$t")" && [ -n "$pane" ] && by="chain-tty"
 fi
-# 2. codex: status.sh が解決済みの pid(sessionId で引く)
+# 2. codex: the pid status.sh already resolved (looked up by sessionId)
 if [ -z "$pane" ] && [ -n "$sid" ]; then
   for f in "${CODEX_HOME:-$HOME/.codex}"/hatch-status/*.json; do
     [ -f "$f" ] || continue
@@ -77,7 +77,7 @@ if [ -z "$pane" ] && [ -n "$sid" ]; then
     [ -n "$t" ] && pane="$(pane_by_tty "$t")" && [ -n "$pane" ] && { by="status-file"; agent="${agent:-codex}"; break; }
   done
 fi
-# 3. cwd が一致する、claude/codex を動かしている pane
+# 3. a pane running claude/codex whose cwd matches
 if [ -z "$pane" ] && [ -n "$cwd" ]; then
   want="$(canon "$cwd")"
   while read -r ppid_ pane_ path_; do
@@ -99,7 +99,7 @@ EOF_PANES
   *) pane="$candidates"; candidates=""; by="cwd" ;;
   esac
 fi
-# 4. 最後の手段: TMUX_PANE
+# 4. last resort: TMUX_PANE
 if [ -z "$pane" ] && [ -z "$candidates" ] && pane_alive "${TMUX_PANE:-}"; then
   pane="$TMUX_PANE"; by="TMUX_PANE"
 fi
@@ -111,7 +111,7 @@ if [ -n "$pane" ]; then
   fi
   where="$session"
 elif [ -n "$candidates" ]; then
-  # 候補を勝手に選ばない。セッション名を列挙して OpenClaw 側で確認してもらう
+  # Do not pick among candidates; list the session names and let OpenClaw check
   session=""
   for p in ${candidates//,/ }; do
     s="$(tmux display-message -p -t "$p" '#S' 2>/dev/null)"; session="${session:+$session,}$s"
@@ -124,11 +124,37 @@ fi
 log "resolve event=$event agent=$agent session=$session by=$by apid=${apid:-none} tmux_pane=${TMUX_PANE:-}"
 
 hostflag="${OPENCLAW_HATCH_HOST:+ $OPENCLAW_HATCH_HOST}"
-text="[hatch] $agent $where on $(hostname -s): $what. cwd=${cwd:-?}. Use hatch-capture$hostflag <session> to read the screen."
-case "$where" in "one of"*) ;; *) text="${text/<session>/$session}" ;; esac
+# For sessions started by hatch-launch, add whether report.md exists
+rep=""
+if [ -n "$pane" ]; then
+  outdir="$(tmux show-options -t "$pane" -qv @hatch_out 2>/dev/null)"
+  if [ -n "$outdir" ]; then
+    slug="$(tmux show-options -t "$pane" -qv @hatch_slug 2>/dev/null)"
+    # Without a report.md, save the final response (read-only sessions cannot write files, so this is their deliverable)
+    if [ ! -f "$outdir/report.md" ] && { [ "$event" = Stop ] || [ "$event" = SessionEnd ]; }; then
+      last="$(printf '%s' "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null)"
+      if [ -z "$last" ]; then
+        tp="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)"
+        [ -r "$tp" ] && last="$(jq -r 'select(.type=="assistant") | .message.content | if type=="array" then map(select(.type=="text")|.text)|join("\n") else . end' "$tp" 2>/dev/null | awk 'NF{buf=buf $0 "\n"} /^$/{ } END{printf "%s", buf}' | tail -c 20000)"
+      fi
+      if [ -n "$last" ]; then
+        { printf '# auto-captured final response (%s, %s)\n\n' "$session" "$(date '+%F %T')"; printf '%s\n' "$last"; } >"$outdir/report.md" 2>/dev/null \
+          && log "report auto-captured session=$session bytes=${#last}"
+      fi
+    fi
+    if [ -f "$outdir/report.md" ]; then rep=" slug=$slug report=READY (hatch-report$hostflag $session)"
+    else rep=" slug=$slug report=MISSING (ask the agent to write $outdir/report.md, or read hatch-capture$hostflag $session)"; fi
+  fi
+fi
+if [ -n "$rep" ]; then
+  text="[hatch] $agent $where on $(hostname -s): $what.$rep cwd=${cwd:-?}."
+else
+  text="[hatch] $agent $where on $(hostname -s): $what. cwd=${cwd:-?}. Use hatch-capture$hostflag <session> to read the screen."
+  case "$where" in "one of"*) ;; *) text="${text/<session>/$session}" ;; esac
+fi
 body="$(jq -cn --arg t "$text" --arg a "${OPENCLAW_AGENT_ID:-main}" '{text:$t, mode:"now", agentId:$a}')"
 url="${OPENCLAW_HOOK_URL%/}/wake"
-# hook を待たせないよう背景で送る。結果だけログに残す(token・本文は書かない)。
+# Send in the background so the hook is not delayed; log only the outcome (never the token or the body).
 (
   code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "$url" \
     -H "Authorization: Bearer $OPENCLAW_HOOK_TOKEN" -H 'Content-Type: application/json' \

@@ -1,42 +1,170 @@
 #!/usr/bin/env bash
-# OpenClaw から hatch のセッションを起動する(ポップアップは出さない)。
-#   hatch-launch [--host <ssh-host>] <claude|codex> <dir> [prompt]
-# セッション名は scripts/launch.sh と同じ規則(<prefix><dir のハッシュ>)なので、
-# tmux の picker(prefix+u)に並び、ポップアップで再表示できる。
-# 同じ dir のセッションが既にあれば、prompt をそのセッションへ送る。
-# 出力: 1 行目 "session=<name> state=<created|reused>"
+# Start a hatch session from OpenClaw, one task per session (no popup).
+#   hatch-launch [--host <ssh-host>] [--slug <slug>] [--expect "<what the report must show>"] [--readonly] [--reuse] [--worktree] [--force] \
+#                <claude|codex> <dir> "<instructions>"
+#   --slug     task identifier (derived from the instructions if omitted); keys the session name, out dir and ledger
+#   --expect   what this task must prove, kept in the ledger (defaults to the start of the instructions)
+#   --readonly investigation / review: Claude runs with --permission-mode plan, Codex with --sandbox read-only, so the CLI
+#              itself guarantees nothing is written. Any number may share a dir
+#   (default)  implementation (a writer). Refused if another writer is alive in the same dir (one writer per
+#              working tree): separate with --worktree, send to the existing one with --reuse, or --force
+#   --reuse    if a session for the same dir exists, send the instructions there instead of starting one (old behaviour)
+#   --any-dir  allow launching outside a git repository (by default, outside a repository or in a parent of several is refused)
+#   --no-ledger do not write the ledger (added automatically on the remote side of --host)
+#   --worktree create a git worktree (~/.agents/worktrees/<repo>-<slug>, branch hatch/<slug>) and launch there.
+#              Only when the user asks for a worktree
+# The agent is told to write <out>/report.md when done.
+#   out = ~/.agents/out/<YYYYmmdd-HHMMSS>-<slug>/ on the host the agent runs on; meta.json holds the launch info
+# Output: "session=<name> state=<created|reused> slug=<slug> mode=<write|read> out=<dir> host=<host>"
+# Ledger: one row appended to ~/.openclaw/hatch-ledger.tsv on the Mac (see hatch-ledger list)
 set -uo pipefail
-. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
-DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../scripts" && pwd)"
-# shellcheck source=../../scripts/helpers.sh
-. "$DIR/helpers.sh"
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+HATCH_NO_DISPATCH=1 . "$here/_remote.sh"
 
+host="${HATCH_HOST:-}"; slug=""; expect=""; reuse=""; worktree=""; noledger=""; readonly=""; force=""; anydir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --host) host="$2"; shift 2 ;;
+  --slug) slug="$2"; shift 2 ;;
+  --expect) expect="$2"; shift 2 ;;
+  --reuse) reuse=1; shift ;;
+  --worktree) worktree=1; shift ;;
+  --readonly) readonly=1; shift ;;
+  --force) force=1; shift ;;
+  --any-dir) anydir=1; shift ;;
+  --no-ledger) noledger=1; shift ;;   # used on the remote side of --host (the ledger lives only on the calling Mac)
+  --) shift; break ;;
+  -*) echo "unknown option: $1" >&2; exit 2 ;;
+  *) break ;;
+  esac
+done
 agent="${1:-}"; path="${2:-}"; prompt="${3:-}"
 case "$agent" in
 claude) default_cmd=claude; default_prefix=claude- ;;
 codex)  default_cmd=codex;  default_prefix=codex- ;;
-*) echo "usage: hatch-launch <claude|codex> <dir> [prompt]" >&2; exit 2 ;;
+*) echo "usage: hatch-launch [--host H] [--slug S] [--expect E] [--readonly] [--reuse] [--worktree] [--force] <claude|codex> <dir> [prompt]" >&2; exit 2 ;;
 esac
-[ -d "$path" ] || { echo "no such directory: $path" >&2; exit 1; }
-path="$(cd "$path" && pwd -P)"
 
-prefix="$(agent_option "$agent" session_prefix "$default_prefix")"
-cmd="$(agent_option "$agent" command "$default_cmd")"
-args="$(agent_option "$agent" args '')"
-session="${prefix}$(session_hash "$path")"
+# slug: from the start of the instructions if not given; drop characters tmux session names cannot hold
+sanitize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//; s/--*/-/g' | cut -c1-40; }
+if [ -z "$slug" ]; then
+  slug="$(sanitize "$(printf '%s' "$prompt" | tr -cd '[:alnum:] _-' | head -c 40)")"
+  [ -n "$slug" ] || slug="task-$(date +%H%M%S)"
+else
+  slug="$(sanitize "$slug")"
+fi
+[ -n "$expect" ] || expect="$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-80)"
 
-if tmux has-session -t "=$session" 2>/dev/null; then
-  if [ -n "$prompt" ]; then
-    "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/hatch-send" "$session" "$prompt"
-  fi
-  echo "session=$session state=reused"
+# --host: run remotely, take the output, and write only the ledger here
+if [ -n "$host" ]; then
+  args=(--no-ledger --slug "$slug" --expect "$expect"); [ -n "$reuse" ] && args+=(--reuse); [ -n "$worktree" ] && args+=(--worktree)
+  [ -n "$readonly" ] && args+=(--readonly); [ -n "$force" ] && args+=(--force); [ -n "$anydir" ] && args+=(--any-dir)
+  out="$(hatch_remote_cmd "$host" hatch-launch "${args[@]}" "$agent" "$path" "$prompt")" || { printf '%s\n' "$out"; exit 1; }
+  printf '%s\n' "$out"
+  line="$(printf '%s\n' "$out" | grep -m1 '^session=')"
+  "$here/hatch-ledger" add "$host" "$agent${readonly:+/ro}" "$(sed 's/.*session=\([^ ]*\).*/\1/' <<<"$line")" "$slug" "$(sed 's/.*out=\([^ ]*\).*/\1/' <<<"$line")" "$expect" >/dev/null 2>&1
   exit 0
 fi
 
+DIR="$(cd "$here/../../scripts" && pwd)"
+# shellcheck source=../../scripts/helpers.sh
+. "$DIR/helpers.sh"
+[ -d "$path" ] || { echo "no such directory: $path" >&2; exit 1; }
+path="$(cd "$path" && pwd -P)"
+# Directory check: work happens inside a git repository. Never launch from a parent holding several repositories
+# (such as ~/Git). --any-dir only when running outside a repository is really intended.
+if [ -z "$anydir" ]; then
+  if ! root="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)"; then
+    subs="$(find "$path" -mindepth 2 -maxdepth 2 -name .git 2>/dev/null | sed 's|/\.git$||' | head -5)"
+    if [ -n "$subs" ]; then
+      echo "refused: $path is not a repository but contains repositories. Launch inside one of them:" >&2
+      printf '  %s\n' $subs >&2
+    else
+      echo "refused: $path is not inside a git repository. Use the repository directory, or --any-dir to launch here anyway." >&2
+    fi
+    exit 3
+  fi
+  [ "$root" = "$path" ] || echo "note: $path is inside repository $root (launching in the subdirectory as asked)" >&2
+fi
+prefix="$(agent_option "$agent" session_prefix "$default_prefix")"
+cmd="$(agent_option "$agent" command "$default_cmd")"
+args="$(agent_option "$agent" args '')"
+me="$(hostname -s)"
+
+# --reuse: old behaviour (send to the session for the same dir)
+if [ -n "$reuse" ]; then
+  old="${prefix}$(session_hash "$path")"
+  if tmux has-session -t "=$old" 2>/dev/null; then
+    [ -n "$prompt" ] && "$here/hatch-send" "$old" "$prompt"
+    echo "session=$old state=reused slug=$slug out=$(tmux show-options -t "$old" -qv @hatch_out) host=$me"
+    exit 0
+  fi
+fi
+
+# --worktree
+if [ -n "$worktree" ]; then
+  git -C "$path" rev-parse --show-toplevel >/dev/null 2>&1 || { echo "not a git repo: $path" >&2; exit 1; }
+  root="$(git -C "$path" rev-parse --show-toplevel)"
+  wt="$HOME/.agents/worktrees/$(basename "$root")-$slug"
+  if [ ! -d "$wt" ]; then
+    mkdir -p "$HOME/.agents/worktrees"
+    git -C "$root" worktree add -b "hatch/$slug" "$wt" >/dev/null 2>&1 || git -C "$root" worktree add "$wt" "hatch/$slug" >/dev/null 2>&1 || { echo "git worktree add failed" >&2; exit 1; }
+  fi
+  path="$wt"
+fi
+
+# Writer exclusion: only one session writes to a working tree (read-only sessions do not count)
+mode=write; [ -n "$readonly" ] && mode=read
+if [ "$mode" = write ] && [ -z "$force" ]; then
+  while read -r s_ m_ p_; do
+    [ -n "$s_" ] && [ "$m_" = write ] && [ "$p_" = "$path" ] || continue
+    echo "refused: another writer session '$s_' is working in $path." >&2
+    echo "  use --readonly (investigation/review), --worktree (implement in a separate tree), --reuse (send to that session), or --force" >&2
+    exit 3
+  done <<EOF_W
+$(for s_ in $(tmux list-sessions -F '#S' 2>/dev/null); do
+    m_="$(tmux show-options -t "$s_" -qv @hatch_mode 2>/dev/null)"; [ -n "$m_" ] || continue
+    printf '%s %s %s\n' "$s_" "$m_" "$(tmux display-message -p -t "$s_" '#{pane_current_path}' 2>/dev/null)"
+  done)
+EOF_W
+fi
+
+# Deliverables directory (the out/ contract)
+out="$HOME/.agents/out/$(date +%Y%m%d-%H%M%S)-$slug"
+mkdir -p "$out"
+
+# Session name: <prefix><slug>; -2, -3 ... on collision
+session="${prefix}${slug}"; n=1
+while tmux has-session -t "=$session" 2>/dev/null; do n=$((n+1)); session="${prefix}${slug}-$n"; done
+
+if [ -n "$readonly" ]; then
+footer="
+
+---
+[hatch] Task id: ${slug}. This is a read-only investigation/review: do not change files. Your final response is saved as the deliverable, so make it self-contained with the headings '## Summary', '## Findings' (cite file:line), '## Validation' (what you actually read or ran) and '## Handoff' (unverified points, next steps)."
+else
+footer="
+
+---
+[hatch] Task id: ${slug}. When the work is done you must write the results to ${out}/report.md with the headings '## Summary', '## Changed' (files changed), '## Validation' (checks you ran and their results) and '## Handoff' (unfinished work, next steps, anything needing confirmation). Write report.md before ending your final response. If you stop at a question or an approval, write the current state to report.md as well."
+fi
+full_prompt="${prompt}${footer}"
+jq -n --arg slug "$slug" --arg agent "$agent" --arg session "$session" --arg cwd "$path" --arg host "$me" \
+      --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg expect "$expect" --arg prompt "$prompt" --arg mode "$mode" \
+      '{slug:$slug, agent:$agent, session:$session, cwd:$cwd, host:$host, mode:$mode, started:$started, expect:$expect, prompt:$prompt, status:"running"}' \
+      >"$out/meta.json" 2>/dev/null
+
 full="$cmd"
 [ -n "$args" ] && full="$full $args"
-[ -n "$prompt" ] && full="$full $(printf '%q' "$prompt")"
+if [ -n "$readonly" ]; then
+  case "$agent" in claude) full="$full --permission-mode plan" ;; codex) full="$full --sandbox read-only" ;; esac
+fi
+full="$full $(printf '%q' "$full_prompt")"
 tmux new-session -d -s "$session" -c "$path" "$full" || exit 1
 tmux set-option -t "$session" detach-on-destroy on
-tmux set-option -t "$session" @hatch_openclaw 1   # OpenClaw 発のセッションである印
-echo "session=$session state=created"
+tmux set-option -t "$session" @hatch_openclaw 1
+tmux set-option -t "$session" @hatch_slug "$slug"
+tmux set-option -t "$session" @hatch_out "$out"
+tmux set-option -t "$session" @hatch_mode "$mode"
+echo "session=$session state=created slug=$slug mode=$mode out=$out host=$me"
+[ -n "$noledger" ] || "$here/hatch-ledger" add local "$agent${readonly:+/ro}" "$session" "$slug" "$out" "$expect" >/dev/null 2>&1 || true

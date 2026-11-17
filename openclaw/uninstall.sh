@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh が入れたものを全部外す。--purge を付けると OpenClaw 本体(npm)と ~/.openclaw も消す。
+# Remove everything install.sh added. With --purge, also remove OpenClaw itself (npm) and ~/.openclaw.
 set -uo pipefail
 OC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
@@ -33,5 +33,5 @@ if [ "${1:-}" = --purge ]; then
   openclaw gateway stop >/dev/null 2>&1; openclaw gateway uninstall >/dev/null 2>&1
   npm uninstall -g openclaw && rm -rf "$HOME/.openclaw" && echo "purged OpenClaw (npm + ~/.openclaw)"
 else
-  echo "OpenClaw 本体はそのまま。全部消すなら: $0 --purge"
+  echo "OpenClaw itself is kept. To remove everything: $0 --purge"
 fi

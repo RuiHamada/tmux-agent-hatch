@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Read the report.md an agent wrote (results come from a file, not the screen).
+#   hatch-report [--host <ssh-host>] <session>        report.md in the session's out directory
+#   hatch-report [--host <ssh-host>] <out-dir>        an out directory given directly
+# Without a report.md, prints "no report yet" and exits 1 (the agent has not written it yet).
+set -uo pipefail
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
+target="${1:-}"; [ -n "$target" ] || { echo "usage: hatch-report <session|out-dir>" >&2; exit 2; }
+case "$target" in
+/*|~*) out="${target/#\~/$HOME}" ;;
+*) out="$(tmux show-options -t "$target" -qv @hatch_out 2>/dev/null)"
+   [ -n "$out" ] || { echo "session $target has no out dir (not launched by hatch-launch?)" >&2; exit 1; } ;;
+esac
+if [ -f "$out/report.md" ]; then
+  echo "# report: $out/report.md ($(date -r "$out/report.md" '+%m-%d %H:%M'))"; cat "$out/report.md"
+else
+  echo "no report yet: $out/report.md"; exit 1
+fi

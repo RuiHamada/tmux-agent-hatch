@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# セッションの画面(直近 N 行、既定 60)を文字で取り出す。
+# Print the last N lines (default 60) of a session's screen as text.
 #   hatch-capture [--host <ssh-host>] <session> [lines]
 set -uo pipefail
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"

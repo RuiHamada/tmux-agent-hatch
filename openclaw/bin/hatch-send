@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 動いているセッションのエージェントに文字を送る(Enter 付き)。
-#   hatch-send [--host <ssh-host>] <session> <text>      文字を送って Enter
-#   hatch-send [--host <ssh-host>] <session> --key <Key>  tmux のキー名を送る(Down / Up / Enter / Escape / C-c など)
-# 単に "y" や "1" を送れば権限プロンプトや質問にも答えられる。
+# Send text (followed by Enter) to the agent in a running session.
+#   hatch-send [--host <ssh-host>] <session> <text>      send text, then Enter
+#   hatch-send [--host <ssh-host>] <session> --key <Key>  send a tmux key name (Down / Up / Enter / Escape / C-c ...)
+# Sending just "y" or "1" answers permission prompts and questions.
 set -uo pipefail
 . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
 target="${1:-}"; text="${2:-}"
@@ -12,6 +12,6 @@ if [ "$text" = --key ]; then
   key="${3:-}"; [ -n "$key" ] || { echo "usage: hatch-send <session> --key <Key>" >&2; exit 2; }
   tmux send-keys -t "$target" "$key"
 else
-  # 文字を送ってから少し待って Enter(TUI が入力を取り込む時間)。実機で 1 回で通ることを確認済み
+  # Type, wait a moment for the TUI to take the input, then Enter. Verified to go through with a single Enter.
   tmux send-keys -t "$target" -l -- "$text" && sleep 0.5 && tmux send-keys -t "$target" Enter
 fi

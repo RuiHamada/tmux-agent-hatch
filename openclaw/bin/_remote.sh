@@ -1,14 +1,18 @@
 # shellcheck shell=bash
-# hatch-* 共通: `--host <ssh-host>`(または HATCH_HOST)が付いていたら、同じコマンドを
-# その ssh ホストで実行して終わる。ホスト側にも openclaw/install.sh --remote が必要。
+# Shared by hatch-*: with a leading `--host <ssh-host>` (or HATCH_HOST), run the same command on
+# that ssh host and exit. The host needs openclaw/install.sh --remote as well.
+hatch_remote_cmd() {   # <host> <cmd> <args...>: run over ssh (without exec)
+  local host="$1" cmd="$2"; shift 2
+  local q="" a
+  for a in "$@"; do q="$q $(printf '%q' "$a")"; done
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" "PATH=\$HOME/.local/bin:\$PATH $cmd$q"
+}
 hatch_remote_dispatch() {
   local host="${HATCH_HOST:-}" cmd
   cmd="$(basename "$0")"
   if [ "${1:-}" = --host ]; then host="$2"; shift 2; fi
   [ -n "$host" ] || return 0
-  local q=""; local a
-  for a in "$@"; do q="$q $(printf '%q' "$a")"; done
-  exec ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" "PATH=\$HOME/.local/bin:\$PATH $cmd$q"
+  hatch_remote_cmd "$host" "$cmd" "$@"; exit $?
 }
-hatch_remote_dispatch "$@"
+[ -n "${HATCH_NO_DISPATCH:-}" ] || hatch_remote_dispatch "$@"
 if [ "${1:-}" = --host ]; then shift 2; fi
