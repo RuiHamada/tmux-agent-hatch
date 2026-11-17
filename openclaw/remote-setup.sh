@@ -16,7 +16,7 @@ ssh "$host" "git -C '$remote_dir' pull -q --ff-only && bash '$remote_dir/opencla
 
 ssh "$host" 'mkdir -p ~/.openclaw && chmod 700 ~/.openclaw'
 { sed -e "s|^OPENCLAW_HOOK_URL=.*|OPENCLAW_HOOK_URL=http://127.0.0.1:$port/hooks|" -e '/^OPENCLAW_HATCH_HOST=/d' "$ENV_FILE"
-  echo "OPENCLAW_HATCH_HOST=--host $host"; } | ssh "$host" 'umask 077; cat > ~/.openclaw/hatch-notify.env'
+  echo "OPENCLAW_HATCH_HOST=\"--host $host\""; } | ssh "$host" 'umask 077; cat > ~/.openclaw/hatch-notify.env'
 echo "sent hatch-notify.env (URL -> 127.0.0.1:$port via RemoteForward)"
 
 cat <<MSG
