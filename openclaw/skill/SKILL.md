@@ -45,6 +45,7 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
   `--reuse` to send to the existing one, `--force` if the user accepts the risk). Read-only (`--readonly`) sessions
   are unlimited.
 - A subdirectory of a monorepo is fine (anything inside the repository passes).
+- With `--host`, dir is a path on that host. `~/repos/xxx` works (it is resolved against the remote home even if the local shell expanded it).
 
 ## Flow
 
@@ -72,6 +73,9 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
    for the first time. Ask the user whether to trust it; if yes, `hatch-send <session> --key Down` then
    `hatch-send <session> --key Enter` (selects "Yes, I trust this folder"). Never send text there (the dialog
    closes and the session ends).
+   Codex shows "Trust this folder?" with "1. Trust and continue" preselected instead; after the user agrees,
+   `hatch-send <session> --key Enter`. Until it is answered the task does not start and no notification arrives,
+   so check `hatch-capture` shortly after launching in a directory for the first time.
 
 ## Rules
 

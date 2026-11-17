@@ -55,8 +55,10 @@ else
 fi
 [ -n "$expect" ] || expect="$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-80)"
 
-# --host: run remotely, take the output, and write only the ledger here
+# --host: run remotely, take the output, and write only the ledger here.
+# The calling shell expands ~ to the local home; map that back to ~ so the remote resolves its own home.
 if [ -n "$host" ]; then
+  case "$path" in "$HOME"/*) path="~${path#"$HOME"}" ;; "$HOME") path="~" ;; esac
   args=(--no-ledger --slug "$slug" --expect "$expect"); [ -n "$reuse" ] && args+=(--reuse); [ -n "$worktree" ] && args+=(--worktree)
   [ -n "$readonly" ] && args+=(--readonly); [ -n "$force" ] && args+=(--force); [ -n "$anydir" ] && args+=(--any-dir)
   out="$(hatch_remote_cmd "$host" hatch-launch "${args[@]}" "$agent" "$path" "$prompt")" || { printf '%s\n' "$out"; exit 1; }
@@ -69,6 +71,7 @@ fi
 DIR="$(cd "$here/../../scripts" && pwd)"
 # shellcheck source=../../scripts/helpers.sh
 . "$DIR/helpers.sh"
+path="${path/#\~/$HOME}"
 [ -d "$path" ] || { echo "no such directory: $path" >&2; exit 1; }
 path="$(cd "$path" && pwd -P)"
 # Directory check: work happens inside a git repository. Never launch from a parent holding several repositories
@@ -160,7 +163,11 @@ if [ -n "$readonly" ]; then
   case "$agent" in claude) full="$full --permission-mode plan" ;; codex) full="$full --sandbox read-only" ;; esac
 fi
 full="$full $(printf '%q' "$full_prompt")"
-tmux new-session -d -s "$session" -c "$path" "$full" || exit 1
+# A session created from a non-interactive client (ssh, OpenClaw's exec) inherits that client's minimal PATH,
+# so set it explicitly. On failure, keep the pane for a minute so hatch-capture can show the error.
+launch_path="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
+wrapped="export PATH=$(printf '%q' "$launch_path"); $full || { rc=\$?; echo \"[hatch] $cmd exited with status \$rc\"; sleep 60; }"
+tmux new-session -d -s "$session" -c "$path" "$wrapped" || exit 1
 tmux set-option -t "$session" detach-on-destroy on
 tmux set-option -t "$session" @hatch_openclaw 1
 tmux set-option -t "$session" @hatch_slug "$slug"

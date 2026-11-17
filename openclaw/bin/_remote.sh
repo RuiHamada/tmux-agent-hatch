@@ -14,5 +14,8 @@ hatch_remote_dispatch() {
   [ -n "$host" ] || return 0
   hatch_remote_cmd "$host" "$cmd" "$@"; exit $?
 }
-[ -n "${HATCH_NO_DISPATCH:-}" ] || hatch_remote_dispatch "$@"
-if [ "${1:-}" = --host ]; then shift 2; fi
+# With HATCH_NO_DISPATCH set, the caller parses --host itself; leave the arguments alone.
+if [ -z "${HATCH_NO_DISPATCH:-}" ]; then
+  hatch_remote_dispatch "$@"
+  if [ "${1:-}" = --host ]; then shift 2; fi
+fi
