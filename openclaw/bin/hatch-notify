@@ -127,8 +127,17 @@ hostflag="${OPENCLAW_HATCH_HOST:+ $OPENCLAW_HATCH_HOST}"
 # For sessions started by hatch-launch, add whether report.md exists
 rep=""
 if [ -n "$pane" ]; then
+  if [ "$(tmux show-options -t "$pane" -qv @hatch_ending 2>/dev/null)" = 1 ]; then
+    log "skip reason=ending session=$session event=$event"; exit 0   # hatch-end is shutting this session down
+  fi
   outdir="$(tmux show-options -t "$pane" -qv @hatch_out 2>/dev/null)"
   if [ -n "$outdir" ]; then
+    # Keep the agent's own session id so the conversation can be resumed after the tmux session is ended.
+    if [ -n "$sid" ] && [ -f "$outdir/meta.json" ]; then
+      jq --arg sid "$sid" --arg tp "$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)" \
+        '.agent_session_id = $sid | (if $tp != "" then .transcript_path = $tp else . end)' "$outdir/meta.json" >"$outdir/meta.json.tmp" 2>/dev/null \
+        && mv -f "$outdir/meta.json.tmp" "$outdir/meta.json"
+    fi
     slug="$(tmux show-options -t "$pane" -qv @hatch_slug 2>/dev/null)"
     # Without a report.md, save the final response (read-only sessions cannot write files, so this is their deliverable)
     if [ ! -f "$outdir/report.md" ] && { [ "$event" = Stop ] || [ "$event" = SessionEnd ]; }; then

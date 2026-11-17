@@ -1,35 +1,60 @@
 #!/usr/bin/env bash
 # Ledger of delegated tasks (~/.openclaw/hatch-ledger.tsv). Tracked in a file, not in OpenClaw's memory.
-#   hatch-ledger list [--all]            open tasks (--all includes closed ones)
+#   hatch-ledger list [--all]            open tasks (--all includes closed ones and whether the session is alive)
 #   hatch-ledger show <session|slug>     details of one task
-#   hatch-ledger close <session|slug> [note]   mark done and verified
+#   hatch-ledger close <session|slug> [note]   mark done and verified; a read-only session is ended right away,
+#                                              a writer session after the grace period (see hatch-reap)
 #   hatch-ledger note <session|slug> <text>    append a note (status unchanged)
+#   hatch-ledger status <session> [host]       print open | closed | none (used by hatch-end)
 #   hatch-ledger add <host> <agent> <session> <slug> <out> <expect>   (called by hatch-launch)
-# Columns: started  host  agent  session  slug  out  status  expect  note
+# Columns: started  host  agent  session  slug  out  status  expect  note  closed_at(epoch)
 set -uo pipefail
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 LEDGER="${HATCH_LEDGER:-$HOME/.openclaw/hatch-ledger.tsv}"
-mkdir -p "$(dirname "$LEDGER")"; [ -f "$LEDGER" ] || printf 'started\thost\tagent\tsession\tslug\tout\tstatus\texpect\tnote\n' >"$LEDGER"
+HEADER='started\thost\tagent\tsession\tslug\tout\tstatus\texpect\tnote\tclosed_at\n'
+mkdir -p "$(dirname "$LEDGER")"; [ -f "$LEDGER" ] || printf "$HEADER" >"$LEDGER"
+# Older ledgers lack the closed_at column: rewrite the header only (rows keep an empty value).
+if ! head -1 "$LEDGER" | grep -q 'closed_at'; then
+  { printf "$HEADER"; tail -n +2 "$LEDGER"; } >"$LEDGER.tmp" && mv -f "$LEDGER.tmp" "$LEDGER"
+fi
 cmd="${1:-list}"; shift || true
 clean() { printf '%s' "$1" | tr '\t\n' '  '; }
+reap_bg() { [ -n "${HATCH_NO_REAP:-}" ] || ( HATCH_NO_REAP=1 "$here/hatch-reap" "$@" >/dev/null 2>&1 & ); }
 case "$cmd" in
 add)
   [ $# -ge 6 ] || { echo "usage: hatch-ledger add <host> <agent> <session> <slug> <out> <expect>" >&2; exit 2; }
-  printf '%s\t%s\t%s\t%s\t%s\t%s\topen\t%s\t\n' "$(date +%Y-%m-%dT%H:%M)" "$(clean "$1")" "$(clean "$2")" "$(clean "$3")" "$(clean "$4")" "$(clean "$5")" "$(clean "$6")" >>"$LEDGER" ;;
+  printf '%s\t%s\t%s\t%s\t%s\t%s\topen\t%s\t\t\n' "$(date +%Y-%m-%dT%H:%M)" "$(clean "$1")" "$(clean "$2")" "$(clean "$3")" "$(clean "$4")" "$(clean "$5")" "$(clean "$6")" >>"$LEDGER" ;;
 list)
   all=""; [ "${1:-}" = --all ] && all=1
-  awk -F'\t' -v all="$all" -v now="$(date +%s)" 'NR==1 { print "age\thost\tagent\tsession\tslug\tstatus\texpect\tnote"; next }
+  alive=""
+  if [ -n "$all" ]; then
+    # Which sessions still exist, per host (one tmux / ssh call each).
+    . "$here/_alive.sh"; alive="$(hatch_alive_pairs "$LEDGER" | paste -sd"|" -)"   # one line: BSD awk rejects newlines in -v
+  fi
+  awk -F'\t' -v all="$all" -v now="$(date +%s)" -v alive="$alive" '
+    BEGIN { n = split(alive, a, "|"); for (i = 1; i <= n; i++) up[a[i]] = 1 }
+    NR==1 { print "age\thost\tagent\tsession\tslug\tstatus\t" (all ? "alive\t" : "") "expect\tnote"; next }
     all || $7 == "open" {
       cmd = "date -j -f %Y-%m-%dT%H:%M " $1 " +%s 2>/dev/null || date -d " $1 " +%s 2>/dev/null"; cmd | getline t; close(cmd)
       m = int((now - t) / 60); age = (m < 60) ? m "m" : int(m / 60) "h"
-      print age "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $7 "\t" $8 "\t" $9 }' "$LEDGER" ;;
+      print age "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $7 "\t" (all ? ((($2 "/" $4) in up) ? "yes" : "no") "\t" : "") $8 "\t" $9 }' "$LEDGER"
+  reap_bg ;;
 show)
   key="${1:-}"; [ -n "$key" ] || { echo "usage: hatch-ledger show <session|slug>" >&2; exit 2; }
   awk -F'\t' -v k="$key" '$4 == k || $5 == k { printf "started=%s\nhost=%s\nagent=%s\nsession=%s\nslug=%s\nout=%s\nstatus=%s\nexpect=%s\nnote=%s\n", $1,$2,$3,$4,$5,$6,$7,$8,$9; f=1 } END { exit f ? 0 : 1 }' "$LEDGER" || { echo "not in ledger: $key" >&2; exit 1; } ;;
+status)
+  key="${1:-}"; host="${2:-}"; [ -n "$key" ] || { echo "usage: hatch-ledger status <session> [host]" >&2; exit 2; }
+  awk -F'\t' -v k="$key" -v h="$host" 'NR > 1 && $4 == k && (h == "" || $2 == h) { s = $7 } END { print (s == "" ? "none" : s) }' "$LEDGER" ;;
 close|note)
   key="${1:-}"; text="$(clean "${2:-}")"; [ -n "$key" ] || { echo "usage: hatch-ledger $cmd <session|slug> [text]" >&2; exit 2; }
-  awk -F'\t' -v OFS='\t' -v k="$key" -v c="$cmd" -v t="$text" -v d="$(date '+%m-%d %H:%M')" '
-    NR > 1 && ($4 == k || $5 == k) { if (c == "close") $7 = "closed"; if (t != "") $9 = ($9 == "" ? "" : $9 "; ") d " " t; f=1 } { print } END { exit f ? 0 : 1 }' "$LEDGER" >"$LEDGER.tmp" \
+  awk -F'\t' -v OFS='\t' -v k="$key" -v c="$cmd" -v t="$text" -v d="$(date '+%m-%d %H:%M')" -v now="$(date +%s)" '
+    NR > 1 && ($4 == k || $5 == k) {
+      if (c == "close") { if ($7 != "closed") $10 = now; $7 = "closed" }
+      if (t != "") $9 = ($9 == "" ? "" : $9 "; ") d " " t; f=1 }
+    { print } END { exit f ? 0 : 1 }' "$LEDGER" >"$LEDGER.tmp" \
     && mv -f "$LEDGER.tmp" "$LEDGER" || { rm -f "$LEDGER.tmp"; echo "not in ledger: $key" >&2; exit 1; }
-  echo "$cmd: $key" ;;
-*) echo "usage: hatch-ledger list [--all] | show <k> | close <k> [note] | note <k> <text>" >&2; exit 2 ;;
+  echo "$cmd: $key"
+  [ "$cmd" = close ] && reap_bg ;;
+*) echo "usage: hatch-ledger list [--all] | show <k> | close <k> [note] | note <k> <text> | status <session> [host]" >&2; exit 2 ;;
 esac
+exit 0

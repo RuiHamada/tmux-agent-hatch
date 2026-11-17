@@ -16,6 +16,8 @@ OpenClaw (chat) --exec--> hatch-launch → tmux session claude-<slug> (listed in
 | `bin/hatch-launch` | One task per session (`--slug` / `--expect` / `--readonly` / `--reuse` / `--worktree`). Creates `~/.agents/out/<timestamp>-<slug>/`, appends a "write report.md when done" instruction to the prompt, and adds a ledger row |
 | `bin/hatch-report` | Print the report.md in a session's out directory |
 | `bin/hatch-ledger` | Task ledger `~/.openclaw/hatch-ledger.tsv` (list / show / close / note). Tracked in a file, not in OpenClaw's memory |
+| `bin/hatch-end` | End a session whose ledger entry is closed (refuses open entries and sessions not started by hatch-launch; `--force` overrides) |
+| `bin/hatch-reap` | Apply the ending policy to closed tasks; runs in the background from `hatch-launch` and `hatch-ledger list/close` |
 | `bin/hatch-list` | The picker's data source (`scripts/agents.sh`) as TSV |
 | `bin/hatch-capture` / `bin/hatch-send` | Read the screen / send text (tmux capture-pane / send-keys) |
 | `bin/hatch-notify` | Called from Claude / Codex hooks; POSTs a one-line notice to OpenClaw's `/hooks/wake`. Does nothing without `~/.openclaw/hatch-notify.env`. Logs what was sent or skipped and the HTTP status to `~/.openclaw/hatch-notify.log` (never the token or the body) |
@@ -86,6 +88,23 @@ reports that never arrive, and reports accepted without verification.
 - **Ledger**: `~/.openclaw/hatch-ledger.tsv` on the Mac. `hatch-launch` (also with `--host`) adds a row; on a
   notification OpenClaw rereads what to verify (`expect`) with `hatch-ledger show`, checks the report against it,
   and closes with `hatch-ledger close`. `hatch-ledger list` shows open tasks.
+
+## Ending sessions
+
+One task per session leaves an idle agent behind for every delegation, so sessions end through the ledger:
+
+| Session | Ends |
+|---|---|
+| read-only, ledger closed | immediately on `hatch-ledger close` (its deliverable is report.md) |
+| writer, ledger closed | once closed for 120 minutes (`HATCH_REAP_GRACE_MIN`, or `hatch-reap --grace-min N`) and not working or waiting |
+| ledger entry open | never automatically; `hatch-end` refuses without `--force` |
+| not in the ledger (your own sessions) | never |
+
+`hatch-reap` applies this mechanically and is started in the background by `hatch-launch` and by `hatch-ledger list/close`,
+so no daemon is involved; `hatch-reap --dry-run` shows what it would do. Before a session is killed, `meta.json` gets
+`status: "ended"`; hatch-notify has already stored the agent's own session id there (`agent_session_id`), so the conversation
+can be resumed with `claude --resume <id>` / `codex resume <id>`. A session being ended sets `@hatch_ending`, and hatch-notify
+stays silent for it.
 
 ## How hatch-notify finds the source pane
 

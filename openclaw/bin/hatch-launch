@@ -64,7 +64,7 @@ if [ -n "$host" ]; then
   out="$(hatch_remote_cmd "$host" hatch-launch "${args[@]}" "$agent" "$path" "$prompt")" || { printf '%s\n' "$out"; exit 1; }
   printf '%s\n' "$out"
   line="$(printf '%s\n' "$out" | grep -m1 '^session=')"
-  "$here/hatch-ledger" add "$host" "$agent${readonly:+/ro}" "$(sed 's/.*session=\([^ ]*\).*/\1/' <<<"$line")" "$slug" "$(sed 's/.*out=\([^ ]*\).*/\1/' <<<"$line")" "$expect" >/dev/null 2>&1
+  HATCH_NO_REAP=1 "$here/hatch-ledger" add "$host" "$agent${readonly:+/ro}" "$(sed 's/.*session=\([^ ]*\).*/\1/' <<<"$line")" "$slug" "$(sed 's/.*out=\([^ ]*\).*/\1/' <<<"$line")" "$expect" >/dev/null 2>&1
   exit 0
 fi
 
@@ -174,4 +174,5 @@ tmux set-option -t "$session" @hatch_slug "$slug"
 tmux set-option -t "$session" @hatch_out "$out"
 tmux set-option -t "$session" @hatch_mode "$mode"
 echo "session=$session state=created slug=$slug mode=$mode out=$out host=$me"
-[ -n "$noledger" ] || "$here/hatch-ledger" add local "$agent${readonly:+/ro}" "$session" "$slug" "$out" "$expect" >/dev/null 2>&1 || true
+[ -n "$noledger" ] || HATCH_NO_REAP=1 "$here/hatch-ledger" add local "$agent${readonly:+/ro}" "$session" "$slug" "$out" "$expect" >/dev/null 2>&1 || true
+[ -n "$noledger" ] || ( HATCH_NO_REAP=1 "$here/hatch-reap" >/dev/null 2>&1 & )   # end sessions of closed tasks

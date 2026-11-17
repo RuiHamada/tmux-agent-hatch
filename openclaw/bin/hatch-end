@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# End a hatch session whose task is over (kills the tmux session and the agent in it).
+#   hatch-end [--host <ssh-host>] [--force] <session>
+# Refuses unless the ledger entry is closed, and unless the session was started by hatch-launch;
+# --force overrides both. The agent's own session id is kept in <out>/meta.json (agent_session_id), so the
+# conversation can be resumed later with `claude --resume <id>` / `codex resume <id>`.
+set -uo pipefail
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+HATCH_NO_DISPATCH=1 . "$here/_remote.sh"
+host="${HATCH_HOST:-}"; force=""; nocheck=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --host) host="$2"; shift 2 ;;
+  --force) force=1; shift ;;
+  --no-ledger-check) nocheck=1; shift ;;   # remote side of --host: the ledger lives on the calling Mac
+  -*) echo "unknown option: $1" >&2; exit 2 ;;
+  *) break ;;
+  esac
+done
+session="${1:-}"; [ -n "$session" ] || { echo "usage: hatch-end [--host H] [--force] <session>" >&2; exit 2; }
+
+if [ -z "$nocheck" ] && [ -z "$force" ]; then
+  st="$("$here/hatch-ledger" status "$session" "${host:-local}")"
+  case "$st" in
+  closed) ;;
+  open) echo "refused: the ledger entry for $session is still open. Verify the report and hatch-ledger close it first (or --force)." >&2; exit 3 ;;
+  *) echo "refused: $session is not in the ledger (not started by hatch-launch?). Use --force to end it anyway." >&2; exit 3 ;;
+  esac
+fi
+
+if [ -n "$host" ]; then
+  args=(--no-ledger-check); [ -n "$force" ] && args+=(--force)
+  hatch_remote_cmd "$host" hatch-end "${args[@]}" "$session"; rc=$?
+else
+  tmux has-session -t "=$session" 2>/dev/null || { echo "no such session: $session" >&2; exit 1; }
+  if [ -z "$force" ] && [ "$(tmux show-options -t "$session" -qv @hatch_openclaw 2>/dev/null)" != 1 ]; then
+    echo "refused: $session was not started by hatch-launch. Use --force to end it anyway." >&2; exit 3
+  fi
+  out="$(tmux show-options -t "$session" -qv @hatch_out 2>/dev/null)"
+  tmux set-option -t "$session" @hatch_ending 1 2>/dev/null   # tells hatch-notify not to report this shutdown
+  if [ -n "$out" ] && [ -f "$out/meta.json" ]; then
+    jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.status = "ended" | .ended = $t' "$out/meta.json" >"$out/meta.json.tmp" 2>/dev/null \
+      && mv -f "$out/meta.json.tmp" "$out/meta.json"
+  fi
+  tmux kill-session -t "=$session"; rc=$?
+  [ "$rc" -eq 0 ] && echo "ended: $session"
+fi
+[ "$rc" -eq 0 ] && [ -z "$nocheck" ] && HATCH_NO_REAP=1 "$here/hatch-ledger" note "$session" "session ended" >/dev/null 2>&1
+exit "$rc"

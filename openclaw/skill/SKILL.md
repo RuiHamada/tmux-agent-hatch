@@ -25,9 +25,11 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
 | `hatch-launch --worktree ...` | Create a git worktree (`~/.agents/worktrees/<repo>-<slug>`, branch `hatch/<slug>`) and launch there. **Only when the user asks for a worktree** |
 | `hatch-launch --reuse ...` | Old behaviour: send the instructions to the existing session for the same dir. **Only for a follow-up of the same task** |
 | `hatch-report <session>` | Read the agent's report.md (Summary / Changed / Validation / Handoff). Prints "no report yet" if absent |
-| `hatch-ledger list` | Open tasks: age, host, session, slug, expect, note |
+| `hatch-ledger list` | Open tasks: age, host, session, slug, expect, note. `--all` adds closed tasks and whether each session is still alive |
 | `hatch-ledger show <session\|slug>` | One task in detail (expect = what must be verified) |
-| `hatch-ledger close <session\|slug> "<what was verified>"` | Close after verifying the report |
+| `hatch-ledger close <session\|slug> "<what was verified>"` | Close after verifying the report. A read-only session is ended right away; a writer session 2 hours later if idle |
+| `hatch-end <session>` | End a session now (kills the tmux session and its agent). Refused while the ledger entry is open. Use when the user says the work is finished and does not want to wait for the grace period |
+| `hatch-reap` | Apply the ending policy to all closed tasks. Runs by itself after `hatch-launch` and `hatch-ledger list/close`; run it on heartbeat too |
 | `hatch-ledger note <session\|slug> "<note>"` | Record progress (stays open) |
 | `hatch-list` | Running agents (TSV: agent, status, age, location, path, session, slug, mode). status is waiting / idle / busy / ?; mode is write / read |
 | `hatch-capture <session> [lines]` | The last N lines of the screen (default 60). For questions, permission prompts, and when there is no report |
@@ -86,4 +88,8 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
 - Close a ledger entry only after checking the report's Validation against expect. "It says it is done" is not enough.
 - The last `❯` line of the screen may show faint text (e.g. a suggested follow-up). That is Claude Code's suggestion,
   not unsent input. Do not resend.
-- Stop a session only when the user says so: `tmux kill-session -t <session>`. Keep sessions of closed tasks until the user says otherwise.
+- Sessions end through the ledger, never with `tmux kill-session`: closing a verified task ends a read-only session at once and a
+  writer session after the grace period; `hatch-end <session>` ends a closed task immediately. Never end a session whose ledger entry
+  is open, and never touch sessions that are not in the ledger (they are the user's own).
+- An ended task can be resumed: `agent_session_id` in `<out>/meta.json` works with `claude --resume <id>` / `codex resume <id>`.
+  To continue such work, launch a new task that says so; do not try to revive the old tmux session.
