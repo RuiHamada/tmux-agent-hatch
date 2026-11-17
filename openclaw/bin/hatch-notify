@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Claude Code / Codex の hook から呼ばれ、OpenClaw の /hooks/wake に短い通知を送る。
+# 設定ファイル(~/.openclaw/hatch-notify.env)が無ければ何もしない。失敗しても黙って 0 で抜ける。
+# 対象は hatch のセッション(claude-* / codex-*)の中で動くエージェントだけ。
+set -uo pipefail
+env_file="${HATCH_NOTIFY_ENV:-$HOME/.openclaw/hatch-notify.env}"
+[ -r "$env_file" ] || exit 0
+# shellcheck disable=SC1090
+. "$env_file"
+[ -n "${OPENCLAW_HOOK_URL:-}" ] && [ -n "${OPENCLAW_HOOK_TOKEN:-}" ] || exit 0
+[ -n "${TMUX_PANE:-}" ] || exit 0
+
+input="$(cat 2>/dev/null)"
+event="$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)"
+cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
+session="$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null)"
+case "$session" in claude-*) agent=claude ;; codex-*) agent=codex ;; *) exit 0 ;; esac
+case "$event" in
+Stop)                        what="turn finished (idle)" ;;
+Notification)                what="waiting: permission prompt" ;;
+PreToolUse)                  what="waiting: question for you" ;;
+PermissionRequest)           what="waiting: permission prompt" ;;
+SessionEnd)                  what="session ended" ;;
+*)                           exit 0 ;;
+esac
+hostflag="${OPENCLAW_HATCH_HOST:+ $OPENCLAW_HATCH_HOST}"
+text="[hatch] $agent $session on $(hostname -s): $what. cwd=${cwd:-?}. Use hatch-capture$hostflag $session to read the screen."
+( curl -sS -m 5 -o /dev/null -X POST "${OPENCLAW_HOOK_URL%/}/wake" \
+    -H "Authorization: Bearer $OPENCLAW_HOOK_TOKEN" -H 'Content-Type: application/json' \
+    --data "$(jq -cn --arg t "$text" --arg a "${OPENCLAW_AGENT_ID:-main}" '{text:$t, mode:"now", agentId:$a}')" \
+    >/dev/null 2>&1 & )
+exit 0

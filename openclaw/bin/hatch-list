@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# hatch が把握しているエージェントを TSV で出す(picker と同じ情報源)。
+#   agent  status  age  location  path  session
+# status: waiting(入力待ち) / idle(完了、こちらの番) / busy(作業中) / ?(不明)
+set -uo pipefail
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../scripts" && pwd)"
+printf 'agent\tstatus\tage\tlocation\tpath\tsession\n'
+"$DIR/agents.sh" 2>/dev/null | sed $'s/\x1b\\[[0-9;]*m//g' |
+  awk -F'\t' '{
+    status = $6; sub(/^● */, "", status); gsub(/ +$/, "", status)
+    age = $7; gsub(/^ +| +$/, "", age)
+    loc = $8; sess = loc; sub(/:.*/, "", sess)
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n", $5, status, age, loc, $9, sess
+  }'

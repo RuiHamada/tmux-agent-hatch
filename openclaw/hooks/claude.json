@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "PreToolUse":   [ { "matcher": "AskUserQuestion",  "hooks": [ { "type": "command", "command": "bash \"__OC_DIR__/bin/hatch-notify\"" } ] } ],
+    "Notification": [ { "matcher": "permission_prompt", "hooks": [ { "type": "command", "command": "bash \"__OC_DIR__/bin/hatch-notify\"" } ] } ],
+    "Stop":         [ { "matcher": "",                  "hooks": [ { "type": "command", "command": "bash \"__OC_DIR__/bin/hatch-notify\"" } ] } ],
+    "SessionEnd":   [ {                                 "hooks": [ { "type": "command", "command": "bash \"__OC_DIR__/bin/hatch-notify\"" } ] } ]
+  }
+}

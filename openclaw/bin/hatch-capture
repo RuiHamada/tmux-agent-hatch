@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# セッションの画面(直近 N 行、既定 60)を文字で取り出す。
+#   hatch-capture [--host <ssh-host>] <session> [lines]
+set -uo pipefail
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
+target="${1:-}"; lines="${2:-60}"
+[ -n "$target" ] || { echo "usage: hatch-capture <session> [lines]" >&2; exit 2; }
+tmux capture-pane -p -J -t "$target" -S "-$lines" 2>/dev/null | sed -e 's/[[:space:]]*$//' | awk 'NF || prev { print } { prev = NF }'

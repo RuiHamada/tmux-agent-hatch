@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# OpenClaw ⇄ tmux-agent-hatch の連携を入れる。何度実行してもよい。消すときは uninstall.sh。
+#   1. bin/ を ~/.local/bin に symlink(hatch-launch などを OpenClaw の exec と hook から呼べるように)
+#   2. skill/ を ~/.openclaw/skills/hatch に symlink
+#   3. Claude Code / Codex の hook に hatch-notify を追加(既存の hatch の hook とは別エントリ)
+#   4. OpenClaw の受け口(hooks.enabled + token)を設定し、~/.openclaw/hatch-notify.env にその token と URL を書く
+set -euo pipefail
+OC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$HOME/.local/bin"
+SKILLS="$HOME/.openclaw/skills"
+ENV_FILE="$HOME/.openclaw/hatch-notify.env"
+CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+CODEX_HOOKS="${CODEX_HOME:-$HOME/.codex}/hooks.json"
+MODE="${1:-}"   # --remote: エージェントが動くだけのホスト(workstation)。OpenClaw 本体は Mac 側
+for t in tmux jq curl; do command -v "$t" >/dev/null 2>&1 || { echo "missing: $t" >&2; exit 1; }; done
+[ "$MODE" = --remote ] || command -v openclaw >/dev/null 2>&1 || { echo "missing: openclaw" >&2; exit 1; }
+
+# 1. bin
+mkdir -p "$BIN"
+for f in "$OC_DIR"/bin/hatch-*; do ln -sfn "$f" "$BIN/$(basename "$f")"; done
+echo "linked bin -> $BIN"
+case ":$PATH:" in *":$BIN:"*) ;; *) echo "note: $BIN is not in PATH" ;; esac
+
+# 2. skill
+[ "$MODE" = --remote ] || {
+mkdir -p "$SKILLS"
+ln -sfn "$OC_DIR/skill" "$SKILLS/hatch"
+echo "linked skill -> $SKILLS/hatch"
+}
+
+# 3. hooks(hatch-notify を含むエントリが無い時だけ足す)
+merge_hooks() {
+  local target="$1" template="$2" ours
+  ours="$(sed "s|__OC_DIR__|$OC_DIR|g" "$template" | jq .hooks)"
+  if [ -f "$target" ] && grep -qF "$OC_DIR/bin/hatch-notify" "$target"; then
+    echo "already configured: $target"; return
+  fi
+  if [ ! -f "$target" ]; then mkdir -p "$(dirname "$target")"; echo '{}' >"$target"; fi
+  cp "$target" "$target.bak-$(date +%Y%m%d%H%M%S)"
+  jq --argjson ours "$ours" \
+    '.hooks = ((.hooks // {}) as $cur | $ours | to_entries | reduce .[] as $e ($cur; .[$e.key] = ((.[$e.key] // []) + $e.value)))' \
+    "$target" >"$target.tmp" && mv -f "$target.tmp" "$target"
+  echo "merged hooks into $target (backup kept)"
+}
+merge_hooks "$CLAUDE_SETTINGS" "$OC_DIR/hooks/claude.json"
+merge_hooks "$CODEX_HOOKS" "$OC_DIR/hooks/codex.json"
+
+# 4. OpenClaw 側の受け口と env
+if [ "$MODE" = --remote ]; then
+  [ -r "$ENV_FILE" ] && echo "env present: $ENV_FILE" || echo "note: $ENV_FILE が無い。Mac 側で remote-setup.sh <host> を実行すると送られる"
+  echo "done (remote)."; exit 0
+fi
+if [ -r "$ENV_FILE" ]; then
+  echo "already configured: $ENV_FILE"
+else
+  token="$(openssl rand -hex 24 2>/dev/null || python3 -c 'import secrets;print(secrets.token_hex(24))')"
+  port="$(openclaw config get gateway.port 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
+  port="${port:-18789}"
+  # 既定エージェント名(onboarding で付けた名前。無ければ main)
+  agent="$(openclaw agents list 2>/dev/null | sed -n 's/^- \([^ ]*\) (default).*/\1/p' | head -1)"
+  agent="${agent:-main}"
+  printf '{ hooks: { enabled: true, token: "%s", path: "/hooks", allowedAgentIds: ["%s"], allowRequestSessionKey: false } }\n' "$token" "$agent" |
+    openclaw config patch --stdin >/dev/null
+  umask 077
+  cat >"$ENV_FILE" <<ENV
+# hatch-notify が OpenClaw へ通知するための設定(uninstall.sh が消す)
+OPENCLAW_HOOK_URL=http://127.0.0.1:$port/hooks
+OPENCLAW_HOOK_TOKEN=$token
+OPENCLAW_AGENT_ID=$agent
+ENV
+  echo "enabled OpenClaw hooks and wrote $ENV_FILE"
+fi
+# exec から hatch-* を見つけられるように PATH を足す
+openclaw config patch --stdin >/dev/null <<<"{ tools: { exec: { pathPrepend: [\"$BIN\"] } } }"
+echo "done. 次: openclaw onboard(モデル接続)→ openclaw gateway run または install → チャットで「hatch で ~/Git/xxx を調べて」"

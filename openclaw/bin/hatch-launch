@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# OpenClaw から hatch のセッションを起動する(ポップアップは出さない)。
+#   hatch-launch [--host <ssh-host>] <claude|codex> <dir> [prompt]
+# セッション名は scripts/launch.sh と同じ規則(<prefix><dir のハッシュ>)なので、
+# tmux の picker(prefix+u)に並び、ポップアップで再表示できる。
+# 同じ dir のセッションが既にあれば、prompt をそのセッションへ送る。
+# 出力: 1 行目 "session=<name> state=<created|reused>"
+set -uo pipefail
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_remote.sh"
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../scripts" && pwd)"
+# shellcheck source=../../scripts/helpers.sh
+. "$DIR/helpers.sh"
+
+agent="${1:-}"; path="${2:-}"; prompt="${3:-}"
+case "$agent" in
+claude) default_cmd=claude; default_prefix=claude- ;;
+codex)  default_cmd=codex;  default_prefix=codex- ;;
+*) echo "usage: hatch-launch <claude|codex> <dir> [prompt]" >&2; exit 2 ;;
+esac
+[ -d "$path" ] || { echo "no such directory: $path" >&2; exit 1; }
+path="$(cd "$path" && pwd -P)"
+
+prefix="$(agent_option "$agent" session_prefix "$default_prefix")"
+cmd="$(agent_option "$agent" command "$default_cmd")"
+args="$(agent_option "$agent" args '')"
+session="${prefix}$(session_hash "$path")"
+
+if tmux has-session -t "=$session" 2>/dev/null; then
+  if [ -n "$prompt" ]; then
+    "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/hatch-send" "$session" "$prompt"
+  fi
+  echo "session=$session state=reused"
+  exit 0
+fi
+
+full="$cmd"
+[ -n "$args" ] && full="$full $args"
+[ -n "$prompt" ] && full="$full $(printf '%q' "$prompt")"
+tmux new-session -d -s "$session" -c "$path" "$full" || exit 1
+tmux set-option -t "$session" detach-on-destroy on
+tmux set-option -t "$session" @hatch_openclaw 1   # OpenClaw 発のセッションである印
+echo "session=$session state=created"

@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "bash \"__OC_DIR__/bin/hatch-notify\"" } ] } ],
+    "Stop":              [ { "hooks": [ { "type": "command", "command": "bash \"__OC_DIR__/bin/hatch-notify\"" } ] } ],
+    "SessionEnd":        [ { "hooks": [ { "type": "command", "command": "bash \"__OC_DIR__/bin/hatch-notify\"" } ] } ]
+  }
+}
