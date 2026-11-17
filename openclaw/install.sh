@@ -28,19 +28,22 @@ ln -sfn "$OC_DIR/skill" "$SKILLS/hatch"
 echo "linked skill -> $SKILLS/hatch"
 }
 
-# 3. hooks(hatch-notify を含むエントリが無い時だけ足す)
+# 3. hooks(イベントごとに、hatch-notify を含むエントリが無いものだけ足す。既存エントリは触らない)
 merge_hooks() {
-  local target="$1" template="$2" ours
+  local target="$1" template="$2" ours needle="$OC_DIR/bin/hatch-notify" missing
   ours="$(sed "s|__OC_DIR__|$OC_DIR|g" "$template" | jq .hooks)"
-  if [ -f "$target" ] && grep -qF "$OC_DIR/bin/hatch-notify" "$target"; then
-    echo "already configured: $target"; return
-  fi
   if [ ! -f "$target" ]; then mkdir -p "$(dirname "$target")"; echo '{}' >"$target"; fi
+  missing="$(jq -r --argjson ours "$ours" --arg needle "$needle" '
+    (.hooks // {}) as $cur | $ours | keys[] |
+    select((($cur[.] // []) | map((.hooks // []) | map(.command // "") | join("\n")) | join("\n") | contains($needle)) | not)' "$target" | paste -sd, -)"
+  if [ -z "$missing" ]; then echo "already configured: $target"; return; fi
   cp "$target" "$target.bak-$(date +%Y%m%d%H%M%S)"
-  jq --argjson ours "$ours" \
-    '.hooks = ((.hooks // {}) as $cur | $ours | to_entries | reduce .[] as $e ($cur; .[$e.key] = ((.[$e.key] // []) + $e.value)))' \
+  jq --argjson ours "$ours" --arg needle "$needle" '
+    .hooks = ((.hooks // {}) as $cur | $ours | to_entries | reduce .[] as $e ($cur;
+      if ((.[$e.key] // []) | map((.hooks // []) | map(.command // "") | join("\n")) | join("\n") | contains($needle))
+      then . else .[$e.key] = ((.[$e.key] // []) + $e.value) end))' \
     "$target" >"$target.tmp" && mv -f "$target.tmp" "$target"
-  echo "merged hooks into $target (backup kept)"
+  echo "merged hooks into $target: $missing (backup kept)"
 }
 merge_hooks "$CLAUDE_SETTINGS" "$OC_DIR/hooks/claude.json"
 merge_hooks "$CODEX_HOOKS" "$OC_DIR/hooks/codex.json"

@@ -16,7 +16,7 @@ OpenClaw(チャット) --exec--> hatch-launch → tmux セッション claude-<h
 | `bin/hatch-launch` | `<claude\|codex> <dir> [prompt]`。`scripts/launch.sh` と同じ名前規則でセッションを作る(ポップアップは出さない)。既存なら prompt を送る |
 | `bin/hatch-list` | picker と同じ情報源(`scripts/agents.sh`)を TSV で |
 | `bin/hatch-capture` / `bin/hatch-send` | 画面を読む / 文字を送る(tmux capture-pane / send-keys) |
-| `bin/hatch-notify` | Claude / Codex の hook から OpenClaw の `POST /hooks/wake` へ短い通知。`~/.openclaw/hatch-notify.env` が無ければ何もしない |
+| `bin/hatch-notify` | Claude / Codex の hook から OpenClaw の `POST /hooks/wake` へ短い通知。`~/.openclaw/hatch-notify.env` が無ければ何もしない。送った/送らなかった理由と HTTP ステータスを `~/.openclaw/hatch-notify.log` に残す(token・本文は書かない) |
 | `hooks/claude.json`, `hooks/codex.json` | hook のテンプレート(hatch 本体の hooks.json とは別エントリ) |
 | `skill/SKILL.md` | OpenClaw のスキル。`~/.openclaw/skills/hatch` に symlink される |
 | `install.sh` / `uninstall.sh` | 入れる / 外す(`--purge` で OpenClaw 本体ごと)。`install.sh --remote` は ssh 先用 |
@@ -57,6 +57,17 @@ gcloud workstations ssh <name> ... -- -L 2222:127.0.0.1:22 -R 18790:127.0.0.1:18
 ```
 
 hatch 本体(`scripts/`、`hooks/`、`hatch.tmux.conf`)は一切変更していないので、このディレクトリを消せば元どおり。
+
+## 通知元の画面の決め方(hatch-notify)
+
+`TMUX_PANE` は信用しない。Codex は TUI から app-server daemon にセッションを渡すため、hook が daemon 側で動くと `TMUX_PANE` は daemon を最初に起動した画面の値(すでに閉じていたり別のセッションになっていたりする)になる。順に試す:
+
+1. hook の親プロセスを辿って `claude` / `codex` のプロセスを見つけ、その tty を持つ pane
+2. (Codex) `hooks/codex/status.sh` が書いた `~/.codex/hatch-status/<pid>.json` の `sessionId` から pid → tty → pane
+3. payload の `cwd` と同じディレクトリで `claude` / `codex` を動かしている pane。複数あれば選ばず、候補のセッション名を列挙して通知する
+4. `TMUX_PANE` がまだ存在する pane を指していればそれ
+
+対象はセッション名(`claude-*` / `codex-*`)ではなく「tmux の pane の中で動いている claude / codex」で、`hatch-list` と同じ基準。手で作ったセッション(例: `graph-ws`)で動かしたエージェントも通知する。通知が来ないときはまず `~/.openclaw/hatch-notify.log` を見る(`skip reason=no-pane` なら画面を特定できなかった、`send-failed http=... curl_exit=...` なら Gateway に届いていない)。
 
 ## 導入時に踏んだ点(2026-11-17、OpenClaw 2026.11.4)
 

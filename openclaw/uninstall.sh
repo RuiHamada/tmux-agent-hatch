@@ -11,7 +11,7 @@ for f in "$OC_DIR"/bin/hatch-*; do
 done
 echo "removed bin links"
 [ -L "$HOME/.openclaw/skills/hatch" ] && rm -f "$HOME/.openclaw/skills/hatch" && echo "removed skill link"
-rm -f "$HOME/.openclaw/hatch-notify.env" && echo "removed hatch-notify.env"
+rm -f "$HOME/.openclaw/hatch-notify.env" "$HOME/.openclaw/hatch-notify.log" && echo "removed hatch-notify.env / .log"
 
 strip_hooks() {
   local target="$1"
