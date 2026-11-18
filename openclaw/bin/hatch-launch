@@ -130,7 +130,10 @@ agent_flags() {   # per-launch flags; never the global tmux options
   local f=""
   case "$agent" in
   codex)  [ -n "$model" ] && f="$f -m $(printf '%q' "$model")"; [ -n "$effort" ] && f="$f -c model_reasoning_effort=$(printf '%q' "$effort")"
-          [ -n "$readonly" ] && f="$f --sandbox read-only" ;;
+          # A writing Codex may write inside its working tree only; the report lives in the out directory, so
+          # make that writable too (otherwise every report write stops at a permission prompt).
+          if [ -n "$readonly" ]; then f="$f --sandbox read-only"
+          elif [ -n "${out:-}" ]; then f="$f --add-dir $(printf '%q' "$out")"; fi ;;
   claude) [ -n "$model" ] && f="$f --model $(printf '%q' "$model")"; [ -n "$effort" ] && f="$f --effort $(printf '%q' "$effort")"
           [ -n "$readonly" ] && f="$f --permission-mode plan" ;;
   esac

@@ -22,6 +22,12 @@
 #     they are not the session's own turn, and their session id is not the conversation to resume
 #   - sessions whose ledger entry is closed (@hatch_closed) or that hatch-end is shutting down (@hatch_ending)
 #   - SessionEnd while the agent is in fact still running
+# Which sessions are notified (OPENCLAW_HATCH_SCOPE in hatch-notify.env):
+#   launched (default)  only sessions started by hatch-launch (@hatch_openclaw); every notice costs OpenClaw a turn,
+#                       so the user's own popup sessions and agents outside tmux are only logged
+#   all                 every claude / codex in a tmux pane, plus the "not in a tmux session" notices
+# A waiting notice carries what is being asked (reason, command; the full text is saved next to the report), and
+# the same notice for the same session is not repeated within OPENCLAW_HATCH_DEDUP_SEC (default 60).
 # What was sent or skipped, and the HTTP status, go to ~/.openclaw/hatch-notify.log (never the token or the body).
 set -uo pipefail
 env_file="${HATCH_NOTIFY_ENV:-$HOME/.openclaw/hatch-notify.env}"
@@ -168,6 +174,17 @@ if [ -n "$nested" ]; then
   log "skip reason=nested-agent event=$event session=${session:-none} by=${by:-none} pid=$first (a child claude process of the session, not its own turn)"
   exit 0
 fi
+scope="${OPENCLAW_HATCH_SCOPE:-launched}"
+launched() { [ "$(tmux show-options -t "$1" -qv @hatch_openclaw 2>/dev/null)" = 1 ]; }
+if [ "$scope" != all ]; then
+  keep=""
+  if [ -n "$pane" ]; then launched "$pane" && keep=1
+  elif [ -n "$candidates" ]; then for p in ${candidates//,/ }; do launched "$p" && keep=1; done; fi
+  if [ -z "$keep" ]; then
+    log "skip reason=not-launched event=$event agent=${agent:-?} session=${session:-none} by=${by:-none} apid=${apid:-none} cwd=${cwd:-?}"
+    exit 0
+  fi
+fi
 unattributed=""
 if [ -z "$where" ]; then
   # No tmux session to name. Say so in the log, and (for a turn that finished or waits) in a wake that names the cwd.
@@ -194,6 +211,7 @@ else
 fi
 
 hostflag="${OPENCLAW_HATCH_HOST:+ $OPENCLAW_HATCH_HOST}"
+waiting=""; case "$event" in Notification | PreToolUse | PermissionRequest) waiting=1 ;; esac
 # For sessions started by hatch-launch, add the round and whether its report exists
 rep=""
 if [ -n "$pane" ]; then
@@ -228,19 +246,67 @@ if [ -n "$pane" ]; then
       fi
     fi
     rtag=""; [ "$round" -gt 1 ] 2>/dev/null && rtag=" round=$round"
-    if [ -f "$rfile" ]; then rep=" slug=$slug$rtag report=READY (hatch-report$hostflag $session)"
+    if [ -n "$waiting" ]; then rep=" slug=$slug$rtag (work in progress; no report is expected yet)"
+    elif [ -f "$rfile" ]; then rep=" slug=$slug$rtag report=READY (hatch-report$hostflag $session)"
     else rep=" slug=$slug$rtag report=MISSING (ask the agent to write $rfile, or read hatch-capture$hostflag $session)"; fi
   fi
+fi
+# What a waiting agent is asking: the reason and the command (or question) from the hook payload, shortened for
+# the notice; the full text goes to a file next to the report when the session has an out directory.
+ask=""
+if [ -n "$waiting" ]; then
+  why_="$(printf '%s' "$input" | jq -r '[.tool_input.description?, .tool_input.justification?, .tool_input.reason?, .reason?, .message?]
+        | map(select(type == "string" and . != "")) | first // empty' 2>/dev/null)"
+  cmd_="$(printf '%s' "$input" | jq -r '
+        (.tool_input // {}) as $t
+        | if ($t | type) != "object" then ($t | tostring)
+          elif ($t.questions | type) == "array" then ($t.questions | map(.question // tostring) | join("\n"))
+          elif ($t.command | type) == "array" then ($t.command | map(tostring) | join(" "))
+          elif ($t.command | type) == "string" then $t.command
+          elif ($t | length) > 0 then ($t | del(.description, .justification, .reason) | tostring)
+          else empty end' 2>/dev/null)"
+  tool_="$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null)"
+  log "waiting-payload event=$event session=${session:-none} tool=${tool_:-?} keys=$(printf '%s' "$input" | jq -r '[keys[], ((.tool_input // {}) | if type == "object" then keys[] | "tool_input." + . else empty end)] | join(",")' 2>/dev/null) cmd_chars=${#cmd_}"
+  if [ -n "$cmd_" ]; then
+    short="$(printf '%s\n' "$cmd_" | head -n "${OPENCLAW_HATCH_ASK_LINES:-6}" | cut -c1-300)"; more=""
+    if [ "$short" != "$cmd_" ]; then
+      more=" [shortened]"
+      if [ -n "${outdir:-}" ] && [ -d "$outdir" ]; then
+        af="$outdir/ask-$(printf '%s' "$cmd_" | cksum | cut -d' ' -f1).txt"   # named by content: a repeat is the same file
+        { [ -n "$why_" ] && printf 'Reason: %s\n\n' "$why_"; printf '%s\n' "$cmd_"; } >"$af" 2>/dev/null && more=" [shortened; full text: $af]"
+      fi
+    fi
+    ask=" ${tool_:+$tool_: }$short$more"
+  fi
+  [ -n "$why_" ] && ask=" Reason: $(printf '%s' "$why_" | tr '\n' ' ' | cut -c1-300).${ask:+ Asked:$ask}" || ask="${ask:+ Asked:$ask}"
 fi
 if [ -n "$unattributed" ]; then
   if [ -n "$offtmux" ]; then hint="hatch-capture cannot read it."
   else hint="No tmux session matched this directory; check hatch-list$hostflag."; fi
   text="[hatch] $agent $where on $(hostname -s): $what. cwd=${cwd:-?}. $hint"
+elif [ -n "$waiting" ]; then
+  text="[hatch] $agent $where on $(hostname -s): $what.$rep$ask Answer with hatch-send$hostflag <session> (hatch-capture$hostflag <session> shows the prompt)."
+  case "$where" in "one of"*) ;; *) text="${text//<session>/$session}" ;; esac
 elif [ -n "$rep" ]; then
   text="[hatch] $agent $where on $(hostname -s): $what.$rep cwd=${cwd:-?}."
 else
   text="[hatch] $agent $where on $(hostname -s): $what. cwd=${cwd:-?}. Use hatch-capture$hostflag <session> to read the screen."
   case "$where" in "one of"*) ;; *) text="${text/<session>/$session}" ;; esac
+fi
+# The same waiting notice for the same session again within a short time adds nothing; it would only cost a turn.
+# (Stop is never suppressed: two turns may really finish close together.)
+dd="${OPENCLAW_HATCH_DEDUP_SEC:-60}"
+if [ -n "$waiting" ] && [ "$dd" -gt 0 ] 2>/dev/null; then
+  sdir="${env_file%/*}/hatch-notify.state"; mkdir -p "$sdir" 2>/dev/null
+  sf="$sdir/$(printf '%s' "${session:-$where}" | tr -c 'A-Za-z0-9._-' '_')"
+  h="$(printf '%s' "$text" | cksum | tr -d ' ')"; now="$(date +%s)"
+  if [ -r "$sf" ]; then
+    read -r ph pt <"$sf" 2>/dev/null
+    if [ "${ph:-}" = "$h" ] && [ $((now - ${pt:-0})) -lt "$dd" ]; then
+      log "skip reason=duplicate event=$event session=${session:-none} within=${dd}s"; exit 0
+    fi
+  fi
+  printf '%s %s\n' "$h" "$now" >"$sf" 2>/dev/null
 fi
 body="$(jq -cn --arg t "$text" --arg a "${OPENCLAW_AGENT_ID:-main}" '{text:$t, mode:"now", agentId:$a}')"
 url="${OPENCLAW_HOOK_URL%/}/wake"

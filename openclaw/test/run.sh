@@ -35,6 +35,10 @@ check "ledger shows the model"                 '"$BIN/hatch-ledger" show "$S" | 
 check "round 1 report written by the agent"    'waitfor "[ -f \"$OUT/report.md\" ]"'
 r2="$("$BIN/hatch-launch" --readonly --slug zzt-c --model m-two --effort low codex "$REPO" "review")"
 check "codex gets -m / -c model_reasoning_effort / read-only" 'waitfor "grep -q -- \"-m m-two -c model_reasoning_effort=low --sandbox read-only\" \"$FAKELOG\""'
+REPO3="$W/repo3"; mkdir -p "$REPO3" && git -C "$REPO3" init -q
+r3="$("$BIN/hatch-launch" --slug zzt-cw codex "$REPO3" "write")"; OUT3="$(field "$r3" out)"
+check "writing codex may write its out directory (--add-dir)" 'waitfor "grep -q -- \"--add-dir $OUT3 \" \"$FAKELOG\""'
+check "read-only codex gets no --add-dir"         '! grep -- "--sandbox read-only" "$FAKELOG" | grep -q -- "--add-dir"'
 hl="$("$BIN/hatch-list")"
 check "hatch-list columns carry round and model" 'sed -n 1p <<<"$hl" | grep -q "round.model"'
 
@@ -129,6 +133,8 @@ s = socketserver.TCPServer(('127.0.0.1', 0), H); open(sys.argv[2], 'w').write(st
 PY
 STUB_PID=$!; waitfor "[ -s \"$W/port\" ]"
 printf 'OPENCLAW_HOOK_URL=http://127.0.0.1:%s/hooks\nOPENCLAW_HOOK_TOKEN=test\nOPENCLAW_AGENT_ID=t\nOPENCLAW_HATCH_LOG=%s\n' "$(cat "$W/port")" "$NLOG" >"$W/notify.env"
+cp "$W/notify.env" "$W/notify-default.env"              # the default scope: sessions started by hatch-launch only
+echo 'OPENCLAW_HATCH_SCOPE=all' >>"$W/notify.env"       # the attribution tests below use hand-made sessions
 # Each pane runs a process named "claude"; it fires hooks on request: directly (its own turn) or from a child
 # claude process that has no tty (what Claude Code does for compaction and headless runs).
 cat >"$W/pane.sh" <<PANE
@@ -177,7 +183,7 @@ waitfor '[ "$(tmux display-message -p -t claude-zzt-nd "#{pane_current_path}")" 
 stopjson() { printf '{"hook_event_name":"%s","cwd":"%s","session_id":"x","last_assistant_message":"m"}' "${2:-Stop}" "$1"; }
 detached() {   # <cwd> [event]: no agent in the parent chain, no tty, no TMUX_PANE
   stopjson "$@" >"$W/d.json"
-  env -u TMUX_PANE -u TMUX HATCH_NOTIFY_ENV="$W/notify.env" python3 -c '
+  env -u TMUX_PANE -u TMUX HATCH_NOTIFY_ENV="${HATCH_NOTIFY_ENV:-$W/notify.env}" python3 -c '
 import os, sys, time
 if os.fork(): os._exit(0)
 os.setsid()
@@ -202,7 +208,7 @@ n0="$(grep -c "" "$BODY")"; detached "$W/plain/sub" SessionEnd
 check "SessionEnd that matches no session: logged, no notice"   '[ "$(grep -c "" "$BODY")" -eq "$n0" ] && grep -q "skip reason=no-pane event=SessionEnd" "$NLOG"'
 offtmux() {   # <cwd>: a claude process on its own pty (no pane), registered as a background session
   stopjson "$1" >"$W/o.json"
-  env -u TMUX_PANE -u TMUX HATCH_NOTIFY_ENV="$W/notify.env" HATCH_CLAUDE_SESSIONS="$W/reg" python3 -c '
+  env -u TMUX_PANE -u TMUX HATCH_NOTIFY_ENV="${HATCH_NOTIFY_ENV:-$W/notify.env}" HATCH_CLAUDE_SESSIONS="$W/reg" python3 -c '
 import os, pty, sys
 pid, fd = pty.fork()
 if pid == 0: os.execv(sys.argv[1], ["claude", "-c", sys.argv[2]])
@@ -215,6 +221,34 @@ os.waitpid(pid, 0)' "$W/claude" "printf '{\"kind\":\"bg\",\"name\":\"bg job\"}' 
 n0="$(grep -c "" "$BODY")"; offtmux "$REPO2/other"
 check "background claude (own pty, no pane): not handed to the session in that directory" '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && ! last | grep -q "zzt-nc"'
 check "its wake names it and the cwd"                           'last | grep -q "claude background session ..bg job.. (pid [0-9]*, not in a tmux session) on .*turn finished.*cwd=$REPO2/other\." && grep -q "unattributed reason=not-in-tmux" "$NLOG"'
+
+echo "== hatch-notify: only launched sessions by default; waiting notices say what is asked"
+n0="$(grep -c "" "$BODY")"; HATCH_NOTIFY_ENV="$W/notify-default.env" detached "$REPO2"
+check "session not started by hatch-launch: no notice (default scope)" '[ "$(grep -c "" "$BODY")" -eq "$n0" ] && grep -q "skip reason=not-launched .*session=claude-zzt-nc" "$NLOG"'
+HATCH_NOTIFY_ENV="$W/notify-default.env" offtmux "$REPO2/other"
+check "agent outside tmux: no notice (default scope)"           '[ "$(grep -c "" "$BODY")" -eq "$n0" ]'
+mkdir -p "$W/out/nd"; echo '{}' >"$W/out/nd/meta.json"
+tmux set-option -t claude-zzt-nd @hatch_openclaw 1; tmux set-option -t claude-zzt-nd @hatch_out "$W/out/nd"; tmux set-option -t claude-zzt-nd @hatch_slug zzt-nd
+HATCH_NOTIFY_ENV="$W/notify-default.env" detached "$REPO2/pkg"
+check "launched session: notified"                              '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && last | grep -q "claude-zzt-nd on"'
+ask() {   # permission request with a 12-line command, fired like detached()
+  jq -cn --arg c "$REPO2/pkg" --arg cmd "$(for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo "cmd-line-$i"; done)" \
+    '{hook_event_name:"PermissionRequest", cwd:$c, session_id:"x", tool_name:"shell", tool_input:{command:$cmd, description:"needs to write outside the workspace"}}' >"$W/d.json"
+  env -u TMUX_PANE -u TMUX HATCH_NOTIFY_ENV="$W/notify-default.env" python3 -c '
+import os, sys, time
+if os.fork(): os._exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+time.sleep(0.3)
+os.dup2(os.open(sys.argv[2], os.O_RDONLY), 0)
+os.execv(sys.argv[1], [sys.argv[1]])' "$BIN/hatch-notify" "$W/d.json"; sleep 2
+}
+n0="$(grep -c "" "$BODY")"; ask
+check "permission notice carries the reason and the command"    '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && last | grep -q "waiting: permission prompt" && last | grep -q "Reason: needs to write outside the workspace" && last | grep -q "shell: cmd-line-1"'
+check "long command: shortened, full text saved next to the report" 'last | grep -q "full text: $W/out/nd/ask-" && ! last | grep -q "cmd-line-12" && grep -q "cmd-line-12" "$W"/out/nd/ask-*.txt'
+check "waiting notice does not ask for a report"                '! last | grep -q "report=" && last | grep -q "slug=zzt-nd (work in progress"'
+ask
+check "the same waiting notice again: not repeated"             '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && grep -q "skip reason=duplicate .*session=claude-zzt-nd" "$NLOG"'
 
 echo; echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

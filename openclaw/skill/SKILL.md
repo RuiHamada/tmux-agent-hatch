@@ -68,6 +68,7 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
    `[hatch] <agent> <session> on <host>: ... slug=<slug> [round=<N>] report=READY|MISSING`.
    It names the exact session. Closed tasks send nothing, and "session ended" is sent only when the agent has
    really exited. A notice reading `one of [A,B]` means the session could not be identified; check both with `hatch-list`.
+   Only sessions you started with `hatch-launch` notify you; the user's own sessions do not.
    A notice reading `background session "<name>" (pid ..., not in a tmux session)` comes from a Claude Code
    background job or an agent outside tmux: it belongs to no hatch session, even if one works in the same
    directory, and `hatch-capture` cannot read it; do not report it as that session's progress. A notice reading
@@ -82,8 +83,11 @@ or "on Linux". Notifications include `on <hostname>` and the `--host ...` to use
    - If `report=MISSING`, look with `hatch-capture <session> 80`; if the work is done, `hatch-send <session> "write report.md"`.
    - Once verified, `hatch-ledger close <session> "<what was verified>"` and report the essentials to the user
      (changes, verification results, open issues).
-4. If the notification says "waiting: permission prompt" / "waiting: question", read the screen, relay it to the
-   user, and answer with `hatch-send`. Dangerous operations (delete, push, force) need the user's confirmation first.
+4. If the notification says "waiting: permission prompt" / "waiting: question", it already says what is asked:
+   `Reason: ...` and `Asked: <tool>: <command>` (a long command is shortened and the notice gives the path of the
+   full text, `<out>/ask-<n>.txt`). Decide from that; use `hatch-capture` only when the notice has no `Asked:` part.
+   Relay it to the user and answer with `hatch-send`. Such a notice says `(work in progress; no report is expected
+   yet)`: do not ask the agent for a report at this point. Dangerous operations (delete, push, force) need the user's confirmation first.
    Leave "awaiting approval" in `hatch-ledger note`.
 5. **Periodically** (when the user asks for status, on heartbeat) run `hatch-ledger list`. For tasks open for a long
    time, check liveness with `hatch-list` and `hatch-capture`, and chase if stalled.

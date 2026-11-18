@@ -159,15 +159,24 @@ only point at some other session working in the same place.
 An agent whose own tty is not a tmux pane does not run in tmux: a Claude Code background session (it lives on a
 pty of Claude's daemon, `kind: "bg"` in `~/.claude/sessions/<pid>.json`), or an agent started in a plain terminal.
 Steps 3 and 4 are not tried for it, because a directory match would hand its turns to an unrelated session in the
-same repository. Its Stop / waiting events are still sent, as
+same repository. With `OPENCLAW_HATCH_SCOPE=all` its Stop / waiting events are still sent, as
 `[hatch] claude background session "<name>" (pid <pid>, not in a tmux session) on <host>: ...`, and an event that
 matches no session at all is sent as `(session not identified)` with its `cwd`, so a finished turn is never
-invisible. `OPENCLAW_HATCH_UNATTRIBUTED=0` in `hatch-notify.env` turns these two notices off (they are then only
-logged).
+invisible (`OPENCLAW_HATCH_UNATTRIBUTED=0` turns these two notices off). In the default scope they are only logged.
 
-Targets are "claude / codex running inside a tmux pane", the same rule as `hatch-list`, not session names
-(`claude-*` / `codex-*`). Agents in hand-made sessions (e.g. `graph-ws`) are notified too. When a notification
-does not arrive, read `~/.openclaw/hatch-notify.log` first (`unattributed reason=no-pane|not-in-tmux`: no session could be named and the notice said so;
+**Which sessions are notified.** By default only sessions started by `hatch-launch` (they carry `@hatch_openclaw`).
+Every notice costs OpenClaw a turn, so the user's own popup sessions, hand-made sessions and agents outside tmux are
+only logged (`skip reason=not-launched`). `OPENCLAW_HATCH_SCOPE=all` in `hatch-notify.env` notifies every
+claude / codex in a tmux pane (the same rule as `hatch-list`) and also sends the "not in a tmux session" notices.
+
+**Waiting notices** (permission prompt, question) say what is asked: `Reason: ...` and `Asked: <tool>: <command>`
+from the hook payload, at most 6 lines (`OPENCLAW_HATCH_ASK_LINES`); a longer text is saved as `ask-<n>.txt` in the
+task's out directory and the notice gives the path. They carry `slug=<slug> (work in progress; no report is expected
+yet)` instead of the report state. The same waiting notice for the same session is not repeated within 60 seconds
+(`OPENCLAW_HATCH_DEDUP_SEC`; `Stop` is never suppressed). A writing Codex is started with `--add-dir <out>` so that
+writing the report does not stop at a permission prompt.
+
+When a notification does not arrive, read `~/.openclaw/hatch-notify.log` first (`unattributed reason=no-pane|not-in-tmux`: no session could be named and the notice said so;
 `send-failed http=... curl_exit=...`: the Gateway was not reached).
 
 ## Lessons from setup (2026-11-17, OpenClaw 2026.11.4)
