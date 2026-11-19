@@ -5,7 +5,7 @@
 #   writer session, closed             -> ended once it has been closed for N minutes (default 120,
 #                                         or HATCH_REAP_GRACE_MIN) and the agent is not working or waiting
 #   open ledger entry / not in ledger  -> never touched
-# A session's state is its latest ledger row (a task continued with hatch-launch --continue is open again).
+#   role session, all tasks closed     -> same activity check after HATCH_ROLE_IDLE_MIN (default 720)
 # hatch-ledger close ends read-only sessions itself; this sweep covers writers past their grace period and
 # anything a failed close left behind. It is started (detached) by hatch-launch and hatch-ledger list/close.
 set -uo pipefail
@@ -23,26 +23,38 @@ done
 . "$here/_alive.sh"
 alive="$(hatch_alive_pairs "$LEDGER" | paste -sd"|" -)"   # one line: BSD awk rejects newlines in -v
 now="$(date +%s)"
-# Latest row per host/session; keep the closed ones whose session still exists: host agent session closed_at
+# A role's last close can be on an older round when tasks finish out of order.
 rows="$(awk -F'\t' -v alive="$alive" 'BEGIN { n = split(alive, a, "|"); for (i = 1; i <= n; i++) up[a[i]] = 1 }
-  NR > 1 { k = $2 "/" $4; if (!(k in seen)) order[++m] = k; seen[k] = 1; st[k] = $7; ag[k] = $3; ca[k] = ($10 == "" ? 0 : $10) }
-  END { for (i = 1; i <= m; i++) { k = order[i]; if (st[k] == "closed" && (k in up)) { split(k, p, "/"); print p[1], ag[k], substr(k, length(p[1]) + 2), ca[k] } } }' "$LEDGER")"
+  NR > 1 { k = $2 "/" $4; if (!(k in st)) order[++m] = k
+    st[k] = $7; ag[k] = $3; ca[k] = $10 + 0; role[k] = $13; out[k] = $6
+    if ($7 == "open") has_open[k] = 1
+    if (ca[k] > last_close[k]) last_close[k] = ca[k] }
+  END { for (i = 1; i <= m; i++) { k = order[i]
+    if (st[k] != "closed" || !(k in up) || (role[k] != "" && has_open[k])) continue
+    split(k, p, "/"); OFS="\t"; print p[1], ag[k], substr(k, length(p[1]) + 2), (role[k] != "" ? last_close[k]+0 : ca[k]), out[k], role[k]
+  } }' "$LEDGER")"
 # Read the rows on fd 3 so that nothing run inside the loop can consume them.
-while read -r host agent session closed_at <&3; do
+while IFS=$'\t' read -r host agent session closed_at out role <&3; do
   [ -n "$session" ] || continue
   hostargs=(); [ "$host" = local ] || hostargs=(--host "$host")
-  case "$agent" in
-  */ro) why="read-only, closed" ;;
+  limit="$grace"; label=writer
+  if [ -n "$role" ]; then limit="${HATCH_ROLE_IDLE_MIN:-720}"; label="role $role"; fi
+  case "$role:$agent" in
+  :*/ro) why="read-only, closed" ;;
   *)
     mins=$(( (now - closed_at) / 60 ))
-    [ "$mins" -ge "$grace" ] || continue
+    [ "$mins" -ge "$limit" ] || continue
     # hatch-list: agent status age location path session ...
-    st="$(HATCH_NO_REAP=1 "$here/hatch-list" ${hostargs[@]+"${hostargs[@]}"} 2>/dev/null </dev/null | awk -F'\t' -v s="$session" '$6 == s { print $2; exit }')"
-    case "$st" in working|waiting) continue ;; esac
-    why="writer, closed ${mins}m ago" ;;
+    listing="$(HATCH_NO_REAP=1 "$here/hatch-list" ${hostargs[@]+"${hostargs[@]}"} 2>/dev/null </dev/null)" || { [ -z "$role" ] || continue; }
+    if [ -n "$role" ]; then
+      hatch_role_is_idle "$session" <<<"$listing" || continue
+    fi
+    if awk -F'\t' -v s="$session" '$6 == s && ($2 == "working" || $2 == "waiting") { found=1 } END { exit !found }' <<<"$listing"; then continue; fi
+    why="$label, closed ${mins}m ago" ;;
   esac
   if [ -n "$dry" ]; then echo "would end: $host/$session ($why)"; continue; fi
-  if HATCH_NO_REAP=1 "$here/hatch-end" ${hostargs[@]+"${hostargs[@]}"} "$session" >/dev/null 2>&1 </dev/null; then echo "ended: $host/$session ($why)"
+  case "$role:$agent" in :*/ro) limit=0 ;; esac
+  if HATCH_NO_REAP=1 "$here/hatch-end" ${hostargs[@]+"${hostargs[@]}"} --reap-before "$((now - limit * 60))" "$out" "$session" >/dev/null 2>&1 </dev/null; then echo "ended: $host/$session ($why)"
   else echo "could not end: $host/$session" >&2; fi
 done 3<<EOF_ROWS
 $rows

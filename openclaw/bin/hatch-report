@@ -21,7 +21,16 @@ target="${1:-}"; [ -n "$target" ] || { echo "usage: hatch-report [--host H] [--r
 show() {   # <out-dir> [round]: print that round's report, or the newest one
   local out="$1" r="${2:-}" f=""
   if [ -n "$r" ]; then f="$out/report.md"; [ "$r" -gt 1 ] && f="$out/report-$r.md"
-  else f="$(ls -1 "$out"/report-*.md 2>/dev/null | sort -t- -k2 -n | tail -1)"; [ -n "$f" ] || f="$out/report.md"; fi
+  else
+    local file number latest=1
+    f="$out/report.md"
+    for file in "$out"/report-*.md; do
+      [ -f "$file" ] || continue
+      number="${file##*/report-}"; number="${number%.md}"
+      case "$number" in ''|*[!0-9]*) continue ;; esac
+      if [ "$number" -gt "$latest" ]; then latest="$number"; f="$file"; fi
+    done
+  fi
   if [ -f "$f" ]; then echo "# report: $f ($(date -r "$f" '+%m-%d %H:%M'))"; cat "$f"
   else echo "no report yet: $f"; return 1; fi
 }

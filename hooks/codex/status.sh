@@ -142,8 +142,10 @@ mkdir -p "$dir" 2>/dev/null || exit 0
 tmp="${dir:?}/.${codex_pid:?}.$$"
 if jq -n --argjson pid "$codex_pid" --arg status "$status" --arg sid "$sid" --arg cwd "$cwd" \
   --argjson now "$(( $(date +%s) * 1000 ))" --arg start "$start" \
+  --arg turn "$(jq -r '.turn_id // ""' <<<"$input")" \
+  --arg transcript "$(jq -r '.transcript_path // ""' <<<"$input")" \
   '{kind: "interactive", agent: "codex", pid: $pid, status: $status, sessionId: $sid, cwd: $cwd,
-    statusUpdatedAt: $now, procStart: $start}' >"$tmp" 2>/dev/null; then
+    statusUpdatedAt: $now, procStart: $start, turnId: $turn, transcriptPath: $transcript}' >"$tmp" 2>/dev/null; then
   mv -f "$tmp" "$file" 2>/dev/null && log "wrote $file status=$status"
 else
   log "jq failed for $file"

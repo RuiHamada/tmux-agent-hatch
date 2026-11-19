@@ -46,8 +46,28 @@ codex_recs() {
   local files
   files=("${CODEX_HOME:-$HOME/.codex}"/hatch-status/*.json)
   [ -f "${files[0]}" ] || return 1
-  jq -r '((.statusUpdatedAt // 0) / 1000 | floor | tostring) as $seen
-    | [.pid, .status, .sessionId, .cwd, $seen, .procStart, "codex", "1"] | @tsv' "${files[@]}" 2>/dev/null
+  if [ -n "${HATCH_CHECK_INTERRUPTION:-}" ]; then
+    # An interrupted TUI turn may never run Stop. Only an exact match to the
+    # latest turn lifecycle record can override the hook's busy snapshot.
+    local pid state sid cwd seen start turn transcript last
+    jq -r '[(.pid // "-"), (.status // "-"), (.sessionId // "-"), (.cwd // "-"),
+      ((.statusUpdatedAt // 0) / 1000 | floor | tostring), (.procStart // "-"),
+      (if (.turnId // "") == "" then "-" else .turnId end),
+      (if (.transcriptPath // "") == "" then "-" else .transcriptPath end)] | @tsv' "${files[@]}" 2>/dev/null |
+      while IFS=$'\t' read -r pid state sid cwd seen start turn transcript; do
+        if [ "$state" = busy ] && [ "$turn" != - ] && [ -r "$transcript" ]; then
+          last="$(tail -c 1048576 -- "$transcript" | jq -Rr '
+            fromjson? | select(.type == "event_msg") | .payload |
+            select(.type == "task_started" or .type == "task_complete" or .type == "turn_aborted") |
+            [.type, .turn_id] | @tsv' | tail -1)"
+          [ "$last" != "turn_aborted"$'\t'"$turn" ] || state=idle
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\tcodex\t1\n' "$pid" "$state" "$sid" "$cwd" "$seen" "$start"
+      done
+  else
+    jq -r '((.statusUpdatedAt // 0) / 1000 | floor | tostring) as $seen
+      | [.pid, .status, .sessionId, .cwd, $seen, .procStart, "codex", "1"] | @tsv' "${files[@]}" 2>/dev/null
+  fi
 }
 
 # codex_pane_recs <known-pids>
@@ -170,7 +190,7 @@ well_formed "$claude" || claude="$(claude_cli_recs)"
 codex="$(codex_recs)"
 well_formed "$codex" || codex=''
 # Pass every pid we already know about, so a Codex with a status file is not listed twice.
-codex_extra="$(codex_pane_recs "$(printf '%s\n%s\n' "$claude" "$codex" | cut -f1 | paste -sd' ' -)")"
+codex_extra="$(codex_pane_recs "$(printf '%s\n%s\n' "$claude" "$codex" | cut -f1)")"
 
 recs="$(printf '%s\n%s\n%s\n' "$claude" "$codex" "$codex_extra" | sed '/^$/d')"
 [ -n "$recs" ] || exit 0

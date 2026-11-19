@@ -1,14 +1,67 @@
 #!/usr/bin/env bash
 # Tests for the OpenClaw bridge, with stand-in agents (no model is called).
 #   openclaw/test/run.sh                       local tests
+#   HATCH_TEST_HOST=hatch-test-loopback openclaw/test/run.sh   two private local sockets and simulated ssh
 #   HATCH_TEST_HOST=<ssh-host> openclaw/test/run.sh   also the remote close test against that host
 # Everything runs in throwaway tmux sessions named *-zzt-*, a temporary ledger and a temporary out directory.
 set -uo pipefail
 T="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; BIN="$T/../bin"
 W="$(mktemp -d "${TMPDIR:-/tmp}/hatch-test.XXXXXX")"; W="$(cd "$W" && pwd -P)"
+unset TMUX TMUX_PANE HATCH_HOST
+export TMUX_TMPDIR="$W" CODEX_HOME="$W/codex-config" CLAUDE_CONFIG_DIR="$W/claude-config"
+mkdir -p "$W/bin" "$CLAUDE_CONFIG_DIR/sessions"
+# agents.sh falls back to "claude agents --json" for an empty registry.
+cat >"$W/bin/claude" <<'CLAUDE'
+#!/bin/sh
+[ "$*" = "agents --json" ] || exit 2
+echo '[]'
+CLAUDE
+chmod +x "$W/bin/claude"
+printf '#!/bin/sh\nexec "%s" -f /dev/null -S "%s" "$@"\n' "$(command -v tmux)" "$W/test.sock" >"$W/bin/tmux"
+chmod +x "$W/bin/tmux"
+if [ "${HATCH_TEST_HOST:-}" = hatch-test-loopback ]; then
+  mkdir -p "$W/remote-bin"
+  printf '#!/bin/sh\nexec "%s" -f /dev/null -S "%s" "$@"\n' "$(command -v tmux)" "$W/remote.sock" >"$W/remote-bin/tmux"
+  export HATCH_TEST_ROOT="$W"
+  cat >"$W/bin/ssh" <<'SSH'
+#!/usr/bin/env bash
+while [ "$1" != hatch-test-loopback ]; do
+  case "$1" in -n) shift ;; -o) shift 2 ;; *) exit 2 ;; esac
+done
+shift
+# Production ssh prepends the installed bin. Resolve that same command from the
+# worktree and keep all host-side state on the second test socket instead.
+cmd="${1#'PATH=$HOME/.local/bin:$PATH'}"; cmd="${cmd#;}"
+export PATH="$HATCH_TEST_ROOT/remote-bin:$PATH" HATCH_OUT_ROOT="$HATCH_TEST_ROOT/remote-out"
+export HATCH_LEDGER="$HATCH_TEST_ROOT/remote-ledger.tsv"
+if [ -n "${HATCH_TEST_STALE_IDLE:-}" ] && [[ "$cmd" == *hatch-list* ]]; then
+  printf 'codex\tidle\t0\t0\t/tmp\t%s\n' "$HATCH_TEST_STALE_IDLE"; exit 0
+fi
+if [ -n "${HATCH_TEST_BAD_LIST:-}" ] && [[ "$cmd" == *hatch-list* ]]; then
+  # Partial output from a failed listing must not authorize a shutdown.
+  printf 'codex\tidle\t0\t0\t/tmp\t%s\n' "$HATCH_TEST_BAD_LIST"; exit 1
+fi
+if [ -n "${HATCH_TEST_DROP_REPLY:-}" ] && [[ "$cmd" == *hatch-launch* && "$cmd" == *--no-ledger* ]]; then
+  bash -c "$cmd" >/dev/null && exit 255
+  exit $?
+fi
+# Check the test vector as quoted data before passing it to a shell, including on a broken revision.
+if [ -n "${HATCH_TEST_LITERAL:-}" ]; then
+  python3 - "$cmd" "$HATCH_TEST_LITERAL" <<'CHECK' || exit 65
+import pathlib, sys
+value = pathlib.Path(sys.argv[2]).read_text()
+quoted = "'" + value.replace("'", "'\\''") + "'"
+sys.exit(not sys.argv[1].endswith(" " + quoted))
+CHECK
+fi
+exec "${HATCH_TEST_LOGIN_SHELL:-bash}" -c "$cmd"
+SSH
+  chmod +x "$W/bin/ssh" "$W/remote-bin/tmux" || exit 1
+fi
+export PATH="$W/bin:$BIN:$PATH"
 export HATCH_LEDGER="$W/ledger.tsv" HATCH_OUT_ROOT="$W/out" HATCH_NO_REAP=1
 FAKELOG="$W/fake.log"; : >"$FAKELOG"
-export HATCH_CLAUDE_CMD="env HATCH_FAKE_LOG=$FAKELOG $T/fake-agent" HATCH_CODEX_CMD="env HATCH_FAKE_LOG=$FAKELOG $T/fake-agent"
+export HATCH_CLAUDE_CMD="env HATCH_FAKE_AGENT=claude HATCH_FAKE_LOG=$FAKELOG $T/fake-agent" HATCH_CODEX_CMD="env HATCH_FAKE_AGENT=codex HATCH_FAKE_LOG=$FAKELOG $T/fake-agent"
 REPO="$W/repo"; mkdir -p "$REPO" && git -C "$REPO" init -q && git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 pass=0; fail=0
 ok()   { pass=$((pass+1)); printf '  ok    %s\n' "$1"; }
@@ -18,12 +71,29 @@ alive(){ tmux has-session -t "=$1" 2>/dev/null; }
 field(){ sed -n "s/.*$2=\([^ ]*\).*/\1/p" <<<"$1" | head -1; }
 waitfor(){ local i=0; until eval "$1"; do i=$((i+1)); [ "$i" -gt "${2:-50}" ] && return 1; sleep 0.2; done; }
 cleanup() {
-  for s in $(tmux list-sessions -F '#S' 2>/dev/null | grep -- '-zzt-'); do tmux kill-session -t "=$s" 2>/dev/null; done
+  tmux kill-server 2>/dev/null
   [ -n "${HATCH_TEST_HOST:-}" ] && ssh -n -o BatchMode=yes "$HATCH_TEST_HOST" 'for s in $(tmux list-sessions -F "#S" 2>/dev/null | grep -- "-zzt-"); do tmux kill-session -t "=$s"; done' 2>/dev/null
+  if [ "${HATCH_TEST_HOST:-}" = hatch-test-loopback ]; then "$W/remote-bin/tmux" kill-server 2>/dev/null; fi
   [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null
   rm -rf "$W"
 }
 trap cleanup EXIT
+. "$T/transport.sh"
+if [ "${HATCH_TEST_GROUP:-}" = transport ]; then
+  echo "passed: $pass  failed: $fail"; exit "$((fail != 0))"
+fi
+if [ "${HATCH_TEST_GROUP:-}" = compat ]; then
+  . "$T/compatibility.sh"
+  echo "passed: $pass  failed: $fail"; exit "$((fail != 0))"
+fi
+if [ "${HATCH_TEST_GROUP:-}" = p1 ]; then
+  . "$T/p1.sh"
+  echo "passed: $pass  failed: $fail"; exit "$((fail != 0))"
+fi
+if [ "${HATCH_TEST_GROUP:-}" = review ]; then
+  . "$T/review.sh"
+  echo "passed: $pass  failed: $fail"; exit "$((fail != 0))"
+fi
 
 echo "== launch: model and effort per launch"
 r="$("$BIN/hatch-launch" --slug zzt-w --expect e1 --model m-one --effort high claude "$REPO" "first task")"
@@ -64,6 +134,10 @@ rp="$("$BIN/hatch-report" "$S")"; rp1="$("$BIN/hatch-report" --round 1 "$S")"   
 check "hatch-report shows the newest round"    'sed -n 1p <<<"$rp" | grep -q "/report-2.md"'
 check "hatch-report --round 1 shows the first" 'sed -n 1p <<<"$rp1" | grep -q "/report.md"'
 check "continue keeps the task model"          '"$BIN/hatch-ledger" show "$S" | grep -q "^model=m-one/high"'
+
+reports="$W/out/20261119-123456-many-rounds"; mkdir -p "$reports"
+for f in report.md report-2.md report-9.md report-10.md report-11.md; do echo "$f" >"$reports/$f"; done
+check "latest report sorts double-digit rounds by filename" '[ "$("$BIN/hatch-report" "$reports" | tail -1)" = report-11.md ]'
 
 echo "== --continue on an ended session resumes the saved conversation"
 jq '.agent_session_id = "sid-123"' "$OUT/meta.json" >"$OUT/m" && mv "$OUT/m" "$OUT/meta.json"
@@ -249,6 +323,11 @@ check "long command: shortened, full text saved next to the report" 'last | grep
 check "waiting notice does not ask for a report"                '! last | grep -q "report=" && last | grep -q "slug=zzt-nd (work in progress"'
 ask
 check "the same waiting notice again: not repeated"             '[ "$(grep -c "" "$BODY")" -eq $((n0+1)) ] && grep -q "skip reason=duplicate .*session=claude-zzt-nd" "$NLOG"'
+
+. "$T/role-sessions.sh"
+. "$T/p1.sh"
+. "$T/compatibility.sh"
+. "$T/review.sh"
 
 echo; echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

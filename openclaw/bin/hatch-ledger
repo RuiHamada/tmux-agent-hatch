@@ -1,61 +1,85 @@
 #!/usr/bin/env bash
 # Ledger of delegated tasks (~/.openclaw/hatch-ledger.tsv). Tracked in a file, not in OpenClaw's memory.
-# One row per round of a task; a session's state is the state of its latest row.
-#   hatch-ledger list [--all]            open tasks (--all includes closed ones and whether the session is alive)
+# One row per round of a task; role sessions may have several open tasks.
+#   hatch-ledger list [--all] [--task <id>]            open tasks (--all includes closed ones and whether the session is alive)
 #   hatch-ledger show <session|slug>     the latest round of one task (and how many rounds it has had)
-#   hatch-ledger close <session|slug> [note]   mark done and verified. A read-only session is ended before this
-#                                              returns; a writer session after the grace period (see hatch-reap)
+#   hatch-ledger close <session|slug|task> [note]   mark done and verified. A legacy read-only session is ended before this
+#                                              returns; a legacy writer session after the grace period (see hatch-reap)
 #   hatch-ledger note <session|slug> <text>    append a note (status unchanged)
 #   hatch-ledger status <session> [host]       print open | closed | none (used by hatch-end)
-#   hatch-ledger lookup <session|slug> [host]  latest row as TSV: host agent session slug out round model status
-#   hatch-ledger add <host> <agent> <session> <slug> <out> <expect> [round] [model]   (called by hatch-launch)
-# Columns: started host agent session slug out status expect note closed_at(epoch) round model
+#   hatch-ledger lookup <session|slug> [host]  latest row as TSV: host agent session slug out round model status role task
+#   hatch-ledger add <host> <agent> <session> <slug> <out> <expect> [round] [model] [role] [task]   (called by hatch-launch)
+# Columns: started host agent session slug out status expect note closed_at(epoch) round model role task
 set -uo pipefail
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 HATCH_NO_DISPATCH=1 . "$here/_remote.sh"
 LEDGER="${HATCH_LEDGER:-$HOME/.openclaw/hatch-ledger.tsv}"
-HEADER='started\thost\tagent\tsession\tslug\tout\tstatus\texpect\tnote\tclosed_at\tround\tmodel\n'
-mkdir -p "$(dirname "$LEDGER")"; [ -f "$LEDGER" ] || printf "$HEADER" >"$LEDGER"
+. "$here/_lifecycle.sh"
+if [ "${1:-list}" = close ] || [ "${1:-list}" = add ]; then
+  hatch_lock_command "$0" "$@"
+fi
+HEADER='started\thost\tagent\tsession\tslug\tout\tstatus\texpect\tnote\tclosed_at\tround\tmodel\trole\ttask\n'
+NCOLS=14
+mkdir -p "$(dirname "$LEDGER")" || exit 1
 
 # Serialize writers: several hatch commands may run at once (parallel exec calls, background reaps).
-lock() { local i=0; until mkdir "$LEDGER.lock" 2>/dev/null; do i=$((i+1)); [ "$i" -gt 100 ] && { rm -rf "$LEDGER.lock"; continue; }; sleep 0.05; done; }
-unlock() { rmdir "$LEDGER.lock" 2>/dev/null; }
+lock() { exec 8>>"$LEDGER.write-lock" && hatch_flock ledger <&8 || exit $?; }
+unlock() { exec 8>&-; }
 rewrite() {   # rewrite <awk-args...>: run awk over the ledger and replace it atomically; awk exit status is returned
   lock; local rc
   awk -F'\t' -v OFS='\t' "$@" "$LEDGER" >"$LEDGER.tmp"; rc=$?
-  if [ "$rc" -eq 0 ]; then mv -f "$LEDGER.tmp" "$LEDGER"; else rm -f "$LEDGER.tmp"; fi
+  if [ "$rc" -eq 0 ]; then mv -f "$LEDGER.tmp" "$LEDGER" || rc=$?; else rm -f "$LEDGER.tmp"; fi
   unlock; return "$rc"
 }
 # Older ledgers lack the newer columns: rewrite the header only (rows keep empty values).
-if ! head -1 "$LEDGER" | grep -q 'round'; then
-  lock; { printf "$HEADER"; tail -n +2 "$LEDGER"; } >"$LEDGER.tmp" && mv -f "$LEDGER.tmp" "$LEDGER"; unlock
+if [ ! -f "$LEDGER" ] || ! head -1 "$LEDGER" | grep -q $'\ttask$'; then
+  lock; { printf "$HEADER"; if [ -f "$LEDGER" ]; then tail -n +2 "$LEDGER"; fi; } >"$LEDGER.tmp" && mv -f "$LEDGER.tmp" "$LEDGER"; unlock
 fi
 cmd="${1:-list}"; shift || true
 clean() { printf '%s' "$1" | tr '\t\n' '  '; }
 reap_bg() { [ -n "${HATCH_NO_REAP:-}" ] || HATCH_NO_REAP=1 hatch_detach "$here/hatch-reap"; }
+mark_closed() {
+  local args=(--no-ledger-check --mark-closed --owner "$r_role" "$r_out")
+  [ -z "$r_role" ] || args+=(--owner-round "$r_round")
+  if [ "$r_host" = local ]; then "$here/hatch-end" "${args[@]}" "$r_session"
+  elif [ -n "$r_role" ]; then hatch_remote_cmd "$r_host" hatch-end "${args[@]}" "$r_session"
+  else hatch_remote_cmd "$r_host" tmux set-option -t "=$r_session:" @hatch_closed 1; fi
+}
 case "$cmd" in
+role-names)
+  awk -F'\t' -v h="$1" 'NR>1 && $2 == h && $13 != "" && !seen[$4]++ { print $4 }' "$LEDGER" ;;
 add)
-  [ $# -ge 6 ] || { echo "usage: hatch-ledger add <host> <agent> <session> <slug> <out> <expect> [round] [model]" >&2; exit 2; }
+  [ $# -ge 6 ] || { echo "usage: hatch-ledger add <host> <agent> <session> <slug> <out> <expect> [round] [model] [role] [task]" >&2; exit 2; }
   round="${7:-1}"; model="$(clean "${8:-}")"
-  # A new round supersedes earlier rows of the same session that were left open.
-  rewrite -v h="$(clean "$1")" -v s="$(clean "$3")" -v r="$round" -v now="$(date +%s)" -v d="$(date '+%m-%d %H:%M')" '
-    NR > 1 && $2 == h && $4 == s && $7 == "open" { $7 = "closed"; $10 = now; $9 = ($9 == "" ? "" : $9 "; ") d " superseded by round " r } { print }'
-  lock
-  printf '%s\t%s\t%s\t%s\t%s\t%s\topen\t%s\t\t\t%s\t%s\n' "$(date +%Y-%m-%dT%H:%M)" "$(clean "$1")" "$(clean "$2")" "$(clean "$3")" "$(clean "$4")" "$(clean "$5")" "$(clean "$6")" "$round" "$model" >>"$LEDGER"
-  unlock ;;
+  role="$(clean "${9:-}")"; task="$(clean "${10:-}")"
+  # Supersede and append in a single replacement, so readers see a complete transition.
+  row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\topen\t%s\t\t\t%s\t%s\t%s\t%s' "$(date +%Y-%m-%dT%H:%M)" \
+    "$(clean "$1")" "$(clean "$2")" "$(clean "$3")" "$(clean "$4")" "$(clean "$5")" "$(clean "$6")" "$round" "$model" "$role" "$task")"
+  HATCH_NEW_ROW="$row" rewrite -v h="$1" -v s="$3" -v t="$task" -v role="$role" -v r="$round" -v now="$(date +%s)" -v d="$(date '+%m-%d %H:%M')" '
+    NR > 1 && $2 == h && $4 == s && role == "" && $13 != "" { exit 3 }
+    NR > 1 && $2 == h && $4 == s && $7 == "open" && (role == "" || ("id:" $14) == ("id:" t)) {
+      $7 = "closed"; $10 = now; $9 = ($9 == "" ? "" : $9 "; ") d " superseded by round " r }
+    { print } END { print ENVIRON["HATCH_NEW_ROW"] }' || exit 1 ;;
 list)
-  all=""; [ "${1:-}" = --all ] && all=1
+  all=""; task=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --all) all=1; shift ;;
+    --task) [ -n "${2:-}" ] || exit 2; task="$2"; shift 2 ;;
+    *) echo "usage: hatch-ledger list [--all] [--task <id>]" >&2; exit 2 ;;
+    esac
+  done
   alive=""
   if [ -n "$all" ]; then
     . "$here/_alive.sh"; alive="$(hatch_alive_pairs "$LEDGER" | paste -sd"|" -)"   # one line: BSD awk rejects newlines in -v
   fi
-  awk -F'\t' -v all="$all" -v now="$(date +%s)" -v alive="$alive" '
+  awk -F'\t' -v task="$task" -v all="$all" -v now="$(date +%s)" -v alive="$alive" '
     BEGIN { n = split(alive, a, "|"); for (i = 1; i <= n; i++) up[a[i]] = 1 }
-    NR==1 { print "age\thost\tagent\tsession\tslug\tround\tstatus\t" (all ? "alive\t" : "") "model\texpect\tnote"; next }
-    all || $7 == "open" {
+    NR==1 { print "age\thost\tagent\tsession\tslug\tround\tstatus\t" (all ? "alive\t" : "") "model\texpect\tnote\trole\ttask"; next }
+    (task == "" || ("id:" $14) == ("id:" task)) && (all || task != "" || $7 == "open") {
       cmd = "date -j -f %Y-%m-%dT%H:%M " $1 " +%s 2>/dev/null || date -d " $1 " +%s 2>/dev/null"; cmd | getline t; close(cmd)
       m = int((now - t) / 60); age = (m < 60) ? m "m" : int(m / 60) "h"
-      print age "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" ($11 == "" ? 1 : $11) "\t" $7 "\t" (all ? ((($2 "/" $4) in up) ? "yes" : "no") "\t" : "") ($12 == "" ? "-" : $12) "\t" $8 "\t" $9 }' "$LEDGER"
+      print age "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" ($11 == "" ? 1 : $11) "\t" $7 "\t" (all ? ((($2 "/" $4) in up) ? "yes" : "no") "\t" : "") ($12 == "" ? "-" : $12) "\t" $8 "\t" $9 "\t" $13 "\t" $14 }' "$LEDGER"
   reap_bg ;;
 show)
   key="${1:-}"; [ -n "$key" ] || { echo "usage: hatch-ledger show <session|slug>" >&2; exit 2; }
@@ -64,44 +88,71 @@ show)
       printf "started=%s\nhost=%s\nagent=%s\nsession=%s\nslug=%s\nround=%s (of %d)\nmodel=%s\nout=%s\nstatus=%s\nexpect=%s\nnote=%s\n", f[1],f[2],f[3],f[4],f[5],(f[11]==""?1:f[11]),n,(f[12]==""?"-":f[12]),f[6],f[7],f[8],f[9] }' "$LEDGER" || { echo "not in ledger: $key" >&2; exit 1; } ;;
 lookup)
   key="${1:-}"; host="${2:-}"; [ -n "$key" ] || { echo "usage: hatch-ledger lookup <session|slug> [host]" >&2; exit 2; }
-  awk -F'\t' -v OFS='\t' -v k="$key" -v h="$host" 'NR > 1 && ($4 == k || $5 == k) && (h == "" || $2 == h) { row = $0; f = 1 }
-    END { if (!f) exit 1; split(row, c, "\t"); print c[2], c[3], c[4], c[5], c[6], (c[11]==""?1:c[11]), (c[12]==""?"-":c[12]), c[7] }' "$LEDGER" || { echo "not in ledger: $key" >&2; exit 1; } ;;
+  awk -F'\t' -v OFS='\t' -v exact="${3:-}" -v k="$key" -v h="$host" 'NR > 1 && ($4 == k || (exact != "--exact" && $5 == k)) && (h == "" || $2 == h) { row = $0; f = 1 }
+    END { if (!f) exit 1; split(row, c, "\t"); print c[2], c[3], c[4], c[5], c[6], (c[11]==""?1:c[11]), (c[12]==""?"-":c[12]), c[7], c[13], c[14] }' "$LEDGER" || { echo "not in ledger: $key" >&2; exit 1; } ;;
 status)
   key="${1:-}"; host="${2:-}"; [ -n "$key" ] || { echo "usage: hatch-ledger status <session> [host]" >&2; exit 2; }
-  awk -F'\t' -v k="$key" -v h="$host" 'NR > 1 && $4 == k && (h == "" || $2 == h) { s = $7 } END { print (s == "" ? "none" : s) }' "$LEDGER" ;;
+  awk -F'\t' -v k="$key" -v h="$host" 'NR > 1 && $4 == k && (h == "" || $2 == h) { s = $7; role = $13; if ($7 == "open") open_rows++ } END { print (role != "" && open_rows ? "open" : (s == "" ? "none" : s)) }' "$LEDGER" ;;
 close|note)
+  scope=""
+  if [ "$cmd" = close ]; then
+    case "${1:-}" in --task|--session|--slug) scope="${1#--}"; shift ;; esac
+    if [ -z "$scope" ]; then
+      scope="$(awk -F'\t' -v k="${1:-}" 'NR>1 {
+        if ($13 != "" && ($4 == k || $5 == k)) role_match=1; if ($4 == k) sess=1; if ($5 == k) slug=1; if ($13 != "" && ("id:" $14) == ("id:" k)) task=1 }
+        END { if (sess && slug && !task && !role_match) { print ""; exit }; if (sess+slug+task>1) exit 3; print (sess ? "session" : slug ? "slug" : "task") }' "$LEDGER")" ||
+        { echo "refused: ambiguous close key; specify --task, --session or --slug" >&2; exit 3; }
+    fi
+  fi
   key="${1:-}"; text="$(clean "${2:-}")"; [ -n "$key" ] || { echo "usage: hatch-ledger $cmd <session|slug> [text]" >&2; exit 2; }
-  rewrite -v k="$key" -v c="$cmd" -v t="$text" -v d="$(date '+%m-%d %H:%M')" -v now="$(date +%s)" '
-    NR > 1 && ($4 == k || $5 == k) {
+  actions="$(mktemp "${LEDGER}.actions.XXXXXX")" || exit 1
+  trap 'rm -f "$actions"' EXIT
+  rewrite -v scope="$scope" -v exact="${4:-}" -v actions="$actions" -v cols="$NCOLS" -v host="${3:-}" -v k="$key" -v c="$cmd" -v t="$text" -v d="$(date '+%m-%d %H:%M')" -v now="$(date +%s)" '
+    NR > 1 && (host == "" || $2 == host) && (((scope == "" || scope == "session") && $4 == k) || ((scope == "" || scope == "slug") && exact != "--exact" && $5 == k) || (scope == "task" && $13 != "" && ("id:" $14) == ("id:" k))) {
       # close acts on open rows; a note goes to the latest row only (handled by remembering the last match)
-      if (c == "close" && $7 == "open") { $7 = "closed"; $10 = now; if (t != "") $9 = ($9 == "" ? "" : $9 "; ") d " " t }
+      if (c == "close") {
+        owner = $2 OFS $3 OFS $4 OFS $6 OFS $13
+        if ($13 == "") legacy = owner
+        else if ($7 == "open") owners[$2 SUBSEP $4] = owner
+      }
+      if (c == "close" && $7 == "open") {
+        $7 = "closed"; $10 = now; if (t != "") $9 = ($9 == "" ? "" : $9 "; ") d " " t }
       last = NR; f = 1 }
     { line[NR] = $0 }
     END { if (!f) exit 1
       if (c == "note" && t != "") { split(line[last], x, "\t"); x[9] = (x[9] == "" ? "" : x[9] "; ") d " " t
-        s = x[1]; for (i = 2; i <= 12; i++) s = s "\t" x[i]; line[last] = s }
+        s = x[1]; for (i = 2; i <= cols; i++) s = s "\t" x[i]; line[last] = s }
+      if (c == "close") {
+        if (legacy != "") print legacy > actions
+        for (k in owners) print owners[k] > actions
+      }
       for (i = 1; i <= NR; i++) print line[i] }' || { echo "not in ledger: $key" >&2; exit 1; }
   echo "$cmd: $key"
   if [ "$cmd" = close ] && [ -z "${HATCH_NO_END:-}" ]; then
-    # Act on the session of the latest matching row, in the foreground: background work does not survive
-    # callers that kill their process group when the command returns.
-    if row="$("$0" lookup "$key" 2>/dev/null)"; then
-      IFS=$'\t' read -r r_host r_agent r_session _ <<<"$row"
+    while IFS=$'\t' read -r r_host r_agent r_session r_out r_role <&3; do
       hostargs=(); [ "$r_host" = local ] || hostargs=(--host "$r_host")
+      if [ -n "$r_role" ]; then
+        if [ "$("$0" status "$r_session" "$r_host")" = closed ]; then
+          r_round="$("$0" lookup "$r_session" "$r_host" --exact | cut -f6)"
+          mark_closed 2>/dev/null
+        fi
+        hours="$(awk -v m="${HATCH_ROLE_IDLE_MIN:-720}" 'BEGIN { print m / 60 }')"
+        echo "role session $r_session stays (idle sessions are ended after ${hours}h; the conversation is kept)"
+        continue
+      fi
       case "$r_agent" in
       */ro)
-        if out="$(HATCH_NO_REAP=1 "$here/hatch-end" ${hostargs[@]+"${hostargs[@]}"} "$r_session" 2>&1)"; then echo "$out"
+        if out="$(HATCH_LIFECYCLE_LOCKED=1 HATCH_NO_REAP=1 "$here/hatch-end" ${hostargs[@]+"${hostargs[@]}"} "$r_session" 2>&1)"; then echo "$out"
         else case "$out" in *"no such session"*) echo "session already gone: $r_session" ;; *) echo "could not end $r_session: $out" >&2 ;; esac; fi ;;
       *)
         # Writer: mark the live session as closed (hatch-notify stays silent for it; hatch-launch explains it
         # when it blocks another writer). It is ended after the grace period by hatch-reap.
-        if [ "$r_host" = local ]; then tmux set-option -t "$r_session" @hatch_closed 1 2>/dev/null
-        else hatch_remote_cmd "$r_host" tmux set-option -t "$r_session" @hatch_closed 1 2>/dev/null; fi
+        mark_closed 2>/dev/null
         echo "writer session $r_session stays for the grace period (hatch-end $r_session ends it now; hatch-launch --continue $r_session reopens it)" ;;
       esac
-    fi
+    done 3<"$actions"
     reap_bg
   fi ;;
-*) echo "usage: hatch-ledger list [--all] | show <k> | close <k> [note] | note <k> <text> | status <session> [host] | lookup <k> [host]" >&2; exit 2 ;;
+*) echo "usage: hatch-ledger list [--all] [--task <id>] | show <k> | close <k> [note] | note <k> <text> | status <session> [host] | lookup <k> [host]" >&2; exit 2 ;;
 esac
 exit 0

@@ -12,7 +12,8 @@ ENV_FILE="$HOME/.openclaw/hatch-notify.env"
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 CODEX_HOOKS="${CODEX_HOME:-$HOME/.codex}/hooks.json"
 MODE="${1:-}"   # --remote: a host that only runs agents (workstation); OpenClaw itself is on the Mac
-for t in tmux jq curl; do command -v "$t" >/dev/null 2>&1 || { echo "missing: $t" >&2; exit 1; }; done
+for t in tmux jq curl perl; do command -v "$t" >/dev/null 2>&1 || { echo "missing: $t" >&2; exit 1; }; done
+perl -MFcntl=:flock -MTime::HiRes -e 1 || { echo "missing Perl modules: Fcntl, Time::HiRes" >&2; exit 1; }
 [ "$MODE" = --remote ] || command -v openclaw >/dev/null 2>&1 || { echo "missing: openclaw" >&2; exit 1; }
 
 # 1. bin

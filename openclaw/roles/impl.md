@@ -1,0 +1,1 @@
+Implement the current task in the assigned repository. Follow its acceptance conditions, verify the change through its normal entry points, and record the changes, checks and outstanding decisions in this round's report.

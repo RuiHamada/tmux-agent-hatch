@@ -3,8 +3,8 @@
 # that ssh host and exit. The host needs openclaw/install.sh --remote as well.
 hatch_remote_cmd() {   # <host> <cmd> <args...>: run over ssh (without exec)
   local host="$1" cmd="$2"; shift 2
-  local q="" a
-  for a in "$@"; do q="$q $(printf '%q' "$a")"; done
+  local q="" a escaped_quote="'\\''"
+  for a in "$@"; do q="$q '${a//\'/$escaped_quote}'"; done
   # -n: never read the caller's stdin (inside a `while read` loop ssh would swallow the remaining lines)
   ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$host" "PATH=\$HOME/.local/bin:\$PATH $cmd$q"
 }

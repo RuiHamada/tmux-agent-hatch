@@ -68,12 +68,24 @@ by prefix+W and `hatch-launch --worktree`) and `delegated_session`, and `scripts
 prefix+y / prefix+Y in a directory opens a session the bridge started there instead of starting a second agent.
 Without this directory those helpers simply never match, and hatch behaves as before.
 
+## Repository role sessions
+
+`hatch-launch --role impl --task <id> codex <dir> "<instructions>"` starts or continues the implementation conversation for that host and repository. Each round has its own ledger entry and report. Use `--repo <name>` to distinguish directories with the same basename. Codex review and research sessions inherit the host's configured sandbox. Their full access depends on `sandbox_mode = "danger-full-access"` in the host's Codex configuration. Claude reviews use plan mode.
+
+`hatch-ledger close <task>` closes the task across role sessions. Once all tasks have been closed for 720 minutes (`HATCH_ROLE_IDLE_MIN`), a `hatch-reap` sweep can end the tmux session if the agent is free. The next round resumes the saved conversation. Use `--fresh` on a closed role to start a new conversation and out directory.
+
+Use the full session name with `--continue`, `hatch-report` and `hatch-ledger show`. Claude and Codex reviews share a slug, and a slug lookup returns the latest matching row. When a task id and a session name or slug overlap, use `hatch-ledger close --task <id>`, `--session <name>` or `--slug <slug>`. A legacy session already recorded under a role's name keeps its history. Choose a distinct `--repo` for the new role.
+
+Before reusing a live role, Hatch checks that the agent is idle and the prior round has a report. If the agent was interrupted, inspect the pane with `hatch-capture` and use `hatch-launch --continue <session> "<instructions>"` to resume the same task once it is idle. Read-only role answers carry their task and round on the first line, so a late answer cannot be saved to a different round's report. If the transport outcome is uncertain, inspect the host, session and round from the error before sending anything else.
+
+**Upgrade and rollback.** Back up the coordinator ledger, install the same version on each agent host, then upgrade the coordinator before starting role rounds. An older coordinator reads only the latest row when authorizing end and can trim role columns when writing a note. To roll back, stop dispatch, verify and drain every role using the new coordinator, archive the role ledger and reports, and reconcile outstanding legacy work into a legacy-only ledger before restarting the older coordinator. Keep the archive for recovery.
+
 ## One task per session, report.md, ledger
 
 Countermeasures for problems seen when driving agents through chat: too many tasks piled on one session,
 reports that never arrive, and reports accepted without verification.
 
-- **One task per session**: `hatch-launch` always creates a new session `<prefix><slug>` (`-2`, `-3` on collision).
+- **One task per session**: a launch without `--role` creates a new session `<prefix><slug>` (`-2`, `-3` on collision).
   Follow-up instructions go to an existing session only with `--reuse`. `--worktree` creates or reuses a worktree
   in the same place as hatch's prefix+W (`@hatch_worktree_dir/<branch>`, by default `<repo>-wt/<branch>` next to the
   repository; the branch is the slug, or `--branch <name>`), so a worktree made from chat and one made from the

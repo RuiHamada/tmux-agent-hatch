@@ -8,9 +8,16 @@ set -uo pipefail
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 HATCH_NO_DISPATCH=1 . "$here/_remote.sh"
 host="${HATCH_HOST:-}"; force=""; nocheck=""
+owner_round=""; owner_role=""; owner_out=""; mark=""; idle_only=""; cutoff=""; checked_out=""
+original_args=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
   --host) host="$2"; shift 2 ;;
+  --owner) owner_role="$2"; owner_out="$3"; shift 3 ;;
+  --owner-round) owner_round="$2"; shift 2 ;;
+  --idle-only) idle_only=1; shift ;;
+  --mark-closed) mark=1; shift ;;
+  --reap-before) cutoff="$2"; checked_out="$3"; shift 3 ;;
   --force) force=1; shift ;;
   --no-ledger-check) nocheck=1; shift ;;   # remote side of --host: the ledger lives on the calling Mac
   -*) echo "unknown option: $1" >&2; exit 2 ;;
@@ -19,10 +26,23 @@ while [ $# -gt 0 ]; do
 done
 session="${1:-}"; [ -n "$session" ] || { echo "usage: hatch-end [--host H] [--force] <session>" >&2; exit 2; }
 
+if [ -z "$nocheck" ]; then
+  . "$here/_lifecycle.sh"
+  hatch_lock_command "$0" "${original_args[@]}"
+fi
 if [ -z "$nocheck" ] && [ -z "$force" ]; then
   st="$("$here/hatch-ledger" status "$session" "${host:-local}")"
   case "$st" in
-  closed) ;;
+  closed)
+    row="$("$here/hatch-ledger" lookup "$session" "${host:-local}" --exact)" || exit 1
+    IFS=$'\t' read -r _ _ _ _ owner_out ledger_round _ _ owner_role _ <<<"$row"
+    [ -z "$owner_role" ] || owner_round="$ledger_round"
+    if [ -n "$cutoff" ]; then
+      [ -z "$owner_role" ] || idle_only=1
+      [ "$checked_out" = "$owner_out" ] || exit 3
+      awk -F'\t' -v h="${host:-local}" -v s="$session" -v t="$cutoff" 'NR>1 && $2==h && $4==s && $10+0>t { exit 1 }' \
+        "${HATCH_LEDGER:-$HOME/.openclaw/hatch-ledger.tsv}" || exit 3
+    fi ;;
   open) echo "refused: the ledger entry for $session is still open. Verify the report and hatch-ledger close it first (or --force)." >&2; exit 3 ;;
   *) echo "refused: $session is not in the ledger (not started by hatch-launch?). Use --force to end it anyway." >&2; exit 3 ;;
   esac
@@ -30,20 +50,38 @@ fi
 
 if [ -n "$host" ]; then
   args=(--no-ledger-check); [ -n "$force" ] && args+=(--force)
+  [ -n "$owner_role" ] && args+=(--owner "$owner_role" "$owner_out" --owner-round "$owner_round")
+  [ -n "$idle_only" ] && args+=(--idle-only)
   hatch_remote_cmd "$host" hatch-end "${args[@]}" "$session"; rc=$?
 else
-  tmux has-session -t "=$session" 2>/dev/null || { echo "no such session: $session" >&2; exit 1; }
-  if [ -z "$force" ] && [ "$(tmux show-options -t "$session" -qv @hatch_openclaw 2>/dev/null)" != 1 ]; then
+  id="$(tmux display-message -p -t "=$session:" '#{session_id}' 2>/dev/null)"
+  [ -n "$id" ] || { echo "no such session: $session" >&2; exit 1; }
+  if [ -z "$force" ] && [ "$(tmux show-options -t "$id" -qv @hatch_openclaw 2>/dev/null)" != 1 ]; then
     echo "refused: $session was not started by hatch-launch. Use --force to end it anyway." >&2; exit 3
   fi
-  out="$(tmux show-options -t "$session" -qv @hatch_out 2>/dev/null)"
-  tmux set-option -t "$session" @hatch_ending 1 2>/dev/null   # tells hatch-notify not to report this shutdown
-  if [ -n "$out" ] && [ -f "$out/meta.json" ]; then
-    jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.status = "ended" | .ended = $t' "$out/meta.json" >"$out/meta.json.tmp" 2>/dev/null \
-      && mv -f "$out/meta.json.tmp" "$out/meta.json"
+  out="$(tmux show-options -t "$id" -qv @hatch_out 2>/dev/null)"
+  if [ -z "$force" ]; then
+    live_role="$(tmux show-options -t "$id" -qv @hatch_role)"
+    [ "$live_role" = "$owner_role" ] && { [ -z "$owner_role" ] || [ "$out" = "$owner_out" ]; } ||
+      { echo "refused: $session belongs to a different generation" >&2; exit 3; }
   fi
-  tmux kill-session -t "=$session"; rc=$?
+  if [ -n "$owner_round" ]; then
+    [ "$(tmux show-options -t "$id" -qv @hatch_round)" = "$owner_round" ] &&
+      jq -e --arg r "$owner_round" '(.round|tostring)==$r' "$out/meta.json" >/dev/null 2>&1 ||
+      { echo "refused: $session belongs to a different round" >&2; exit 3; }
+  fi
+  if [ -n "$idle_only" ]; then
+    . "$here/_alive.sh"
+    "$here/hatch-list" | hatch_role_is_idle "$session" || { echo "refused: $session is no longer confirmed idle" >&2; exit 3; }
+  fi
+  if [ -n "$mark" ]; then tmux set-option -t "$id" @hatch_closed 1; exit $?; fi
+  tmux set-option -t "$id" @hatch_ending 1 2>/dev/null   # tells hatch-notify not to report this shutdown
+  if [ -n "$out" ] && [ -f "$out/meta.json" ]; then
+    . "$here/_lifecycle.sh"
+    hatch_update_meta "$out/meta.json" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.status = "ended" | .ended = $t' || { [ -z "$owner_role" ] || { tmux set-option -ut "$id" @hatch_ending; exit 1; }; }
+  fi
+  tmux kill-session -t "$id"; rc=$?
   [ "$rc" -eq 0 ] && echo "ended: $session"
 fi
-[ "$rc" -eq 0 ] && [ -z "$nocheck" ] && HATCH_NO_REAP=1 "$here/hatch-ledger" note "$session" "session ended" >/dev/null 2>&1
+[ "$rc" -eq 0 ] && [ -z "$nocheck" ] && HATCH_NO_REAP=1 "$here/hatch-ledger" note "$session" "session ended" "${host:-local}" --exact >/dev/null 2>&1
 exit "$rc"

@@ -11,3 +11,9 @@ hatch_alive_pairs() {
     fi
   done
 }
+
+# A successful listing may still omit a role or contain an unknown pane.
+hatch_role_is_idle() {
+  awk -F'\t' -v s="$1" '$6 == s { seen=1; if ($2 != "idle") uncertain=1 }
+    END { exit !(seen && !uncertain) }'
+}

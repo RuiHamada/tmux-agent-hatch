@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Start (or continue) a hatch session from OpenClaw, one task per session (no popup).
+# Start (or continue) a hatch session from OpenClaw, with a task or persistent repository role (no popup).
 #   hatch-launch [--host <ssh-host>] [--slug <slug>] [--expect "<what the report must show>"] [--readonly]
 #                [--model <name>] [--effort <level>] [--worktree] [--branch <name>] [--reuse] [--force]
 #                <claude|codex> <dir> "<instructions>"
 #   hatch-launch --continue <session|slug> [--expect "..."] [--model <name>] [--effort <level>] "<instructions>"
 #
+#   hatch-launch [--host H] --role <impl|review|research> --task <id> [--repo <name>] [--fresh]
+#                <claude|codex> <dir> "<instructions>"
+#   --task     a role round's task id; --continue defaults to the prior round's id
+#   --fresh    retire a closed role conversation and start again at round one
 #   --slug     task identifier (derived from the instructions if omitted); keys the session name, out dir and ledger
 #   --expect   what this task (or round) must prove, kept in the ledger (defaults to the start of the instructions)
 #   --readonly investigation / review: Claude runs with --permission-mode plan, Codex with --sandbox read-only, so the CLI
@@ -33,13 +37,46 @@
 set -uo pipefail
 here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 HATCH_NO_DISPATCH=1 . "$here/_remote.sh"
-usage() { echo "usage: hatch-launch [--host H] [--slug S] [--expect E] [--readonly] [--model M] [--effort L] [--worktree] [--reuse] [--force] <claude|codex> <dir> \"<instructions>\"
-       hatch-launch --continue <session|slug> [--expect E] [--model M] [--effort L] \"<instructions>\"" >&2; exit 2; }
+usage() { echo "usage: hatch-launch [--host H] [--slug S | --role impl|review|research --task ID [--repo NAME] [--fresh]] [--expect E] [--readonly] [--model M] [--effort L] [--worktree] [--reuse] [--force] <claude|codex> <dir> \"<instructions>\"
+       hatch-launch --continue <session|slug> [--task ID] [--expect E] [--model M] [--effort L] \"<instructions>\"" >&2; exit 2; }
 
 host="${HATCH_HOST:-}"; slug=""; expect=""; reuse=""; worktree=""; noledger=""; readonly=""; force=""; anydir=""; branch=""
+role=""; task=""; repo=""; fresh=""; retired_out=""; role_dir=""; retire_round=""; recover_task=""
 cont=""; model=""; effort=""; out=""; round=1
+[ "$#" -gt 0 ] || usage
+original_args=("$@")
+. "$here/../../scripts/helpers.sh"
+sanitize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//; s/--*/-/g' | cut -c1-40; }
+sanitize_id() { local id; id="$(sanitize "$1")"; printf '%s' "${id%-}"; }
+check_path() {
+  case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) echo "refused: a ledger path contains a tab or line break" >&2; exit 3 ;; esac
+}
+# Resolve the repository key on the agent's host. Its tmux prefix and physical
+# directory may differ from the coordinator's, especially for ~ or relative paths.
+role_key() {  # <agent> <repo override> <path> <role>
+  local repo="$2" path="$3" role="$4" dir slug
+  check_path "$path"; check_path "${HATCH_OUT_ROOT:-$HOME/.agents/out}"
+  dir="$(cd "${path/#\~/$HOME}" && pwd -P)" || return 1
+  check_path "$dir"
+  if [ -z "$repo" ]; then
+    repo="$(basename "$path")"
+    case "$repo" in .|..|'~') repo="$(basename "$dir")" ;; esac
+  fi
+  repo="$(sanitize_id "$repo")"; [ -n "$repo" ] || usage
+  repo="${repo:0:$((39 - ${#role}))}"; slug="${repo%-}-$role"
+  printf '%s\t%s\t%s\n' "$slug" "$(agent_option "$1" session_prefix "$1-")$slug" "$dir"
+}
+if [ "${1:-}" = --role-key ]; then shift; role_key "$@"; exit; fi
 while [ $# -gt 0 ]; do
   case "$1" in
+  --reserved-names) reserved_names="$2"; shift 2 ;;
+  --recover-task) recover_task=1; shift ;;  # internal: explicit continuation of an interrupted task
+  --retire-round) retire_round="$2"; shift 2 ;;
+  --role-dir) role_dir="$2"; shift 2 ;;   # internal: requested checkout for an automatic continuation
+  --role) role="${2:?missing role}"; shift 2 ;;
+  --repo) repo="${2:?missing repo}"; shift 2 ;;
+  --task) task="${2:?missing task}"; shift 2 ;;
+  --fresh) fresh=1; shift ;;
   --host) host="$2"; shift 2 ;;
   --slug) slug="$2"; shift 2 ;;
   --expect) expect="$2"; shift 2 ;;
@@ -60,14 +97,58 @@ while [ $# -gt 0 ]; do
   *) break ;;
   esac
 done
-sanitize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | sed 's/^-*//; s/-*$//; s/--*/-/g' | cut -c1-40; }
 model_col() { local m="${model:--}"; [ -n "$effort" ] && m="$m/$effort"; printf '%s' "$m"; }   # "name/effort", "-" when unset
+
+refuse() { echo "refused: $*" >&2; exit 3; }
+role_uncertain() {
+  printf 'role launch did not complete: host=%s session=%s task=%s round=%s out=%s\n' "$@" >&2
+  echo "Verify the pane and report with hatch-list, hatch-capture and hatch-report before retrying." >&2
+}
+if [ -z "$noledger" ]; then
+  . "$here/_lifecycle.sh"
+  hatch_lock_command "$0" "${original_args[@]}"
+fi
+
+if [ -n "$task" ]; then task="$(sanitize_id "$task")"; [ -n "$task" ] || usage; fi
+if [ -n "$role" ]; then
+  case "$role" in impl|review|research) ;; *) usage ;; esac
+  [ -n "$task" ] || usage
+elif [ -n "$fresh$repo" ] || { [ -n "$task" ] && [ -z "$cont" ]; }; then usage
+fi
+
+if [ -n "$role" ] && [ -z "$noledger" ]; then
+  agent="${1:-}"; path="${2:-}"; prompt="${3:-}"
+  case "$agent" in claude|codex) ;; *) usage ;; esac
+  [ -n "$path" ] && [ -n "$prompt" ] && [ -z "$cont$slug$reuse" ] || usage
+  if [ "$agent/$role" = claude/review ]; then readonly=1
+  elif [ -n "$readonly" ]; then refuse "$agent/$role requires writer mode"; fi
+  if [ -n "$host" ]; then
+    case "$path" in "$HOME"|"$HOME"/*) path="~${path#"$HOME"}" ;; esac
+    key="$(hatch_remote_cmd "$host" hatch-launch --role-key "$agent" "$repo" "$path" "$role")" || exit $?
+  else key="$(role_key "$agent" "$repo" "$path" "$role")" || exit $?; fi
+  IFS=$'\t' read -r slug target role_dir <<<"$key"
+  if row="$("$here/hatch-ledger" lookup "$target" "${host:-local}" --exact 2>/dev/null)"; then
+    IFS=$'\t' read -r l_host l_agent l_session l_slug l_out l_round l_model l_status l_role l_task <<<"$row"
+    [ "$l_role" = "$role" ] && [ "${l_agent%/ro}" = "$agent" ] || refuse "$target belongs to another session"
+    if [ -n "$fresh" ]; then
+      [ "$("$here/hatch-ledger" status "$target" "$l_host")" = closed ] || refuse "$target has open tasks"
+      retired_out="$l_out"; retire_round="$l_round"
+    else
+      cont="$target"; set -- "$prompt"
+    fi
+  fi
+fi
 
 # ---------------------------------------------------------------- --continue, ledger side
 if [ -n "$cont" ] && [ -z "$noledger" ]; then
   prompt="${1:-}"; [ -n "$prompt" ] || usage
-  row="$(HATCH_NO_REAP=1 "$here/hatch-ledger" lookup "$cont" ${host:+"$host"})" || exit 1
-  IFS=$'\t' read -r l_host l_agent l_session l_slug l_out l_round l_model _ <<<"$row"
+  if [ -z "$role" ]; then
+    row="$(HATCH_NO_REAP=1 "$here/hatch-ledger" lookup "$cont" ${host:+"$host"})" || exit 1
+    IFS=$'\t' read -r l_host l_agent l_session l_slug l_out l_round l_model l_status l_role l_task <<<"$row"
+  fi
+  role="$l_role"; task="${task:-$l_task}"
+  [ -z "$task" ] || [ -n "$role" ] || usage
+  if [ -n "$role" ] && [ -n "$readonly" ] && [ "$l_agent" != claude/ro ]; then refuse "$role requires writer mode"; fi
   agent="${l_agent%/ro}"; case "$l_agent" in */ro) readonly=1 ;; esac
   round=$((l_round + 1)); slug="$l_slug"
   if [ -z "$model" ] && [ -z "$effort" ] && [ "$l_model" != - ]; then   # keep the task's model and effort unless overridden
@@ -76,13 +157,23 @@ if [ -n "$cont" ] && [ -z "$noledger" ]; then
   fi
   [ -n "$expect" ] || expect="$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-80)"
   cargs=(--no-ledger --continue "$l_session" --out "$l_out" --round "$round" --slug "$slug" --expect "$expect")
+  if [ -n "$role" ]; then
+    cargs+=(--role "$role" --task "$task")
+    [ -n "$role_dir" ] || cargs+=(--recover-task)
+  fi
+  if [ -n "$role" ] && [ -n "$worktree" ]; then cargs+=(--branch "${branch:-$slug}"); fi
+  [ -n "$role_dir" ] && cargs+=(--role-dir "$role_dir")
   [ -n "$readonly" ] && cargs+=(--readonly); [ -n "$force" ] && cargs+=(--force)
   [ -n "$model" ] && cargs+=(--model "$model"); [ -n "$effort" ] && cargs+=(--effort "$effort")
   if [ "$l_host" = local ]; then res="$("$0" "${cargs[@]}" "$agent" "$prompt")"; rc=$?
   else res="$(hatch_remote_cmd "$l_host" hatch-launch "${cargs[@]}" "$agent" "$prompt")"; rc=$?; fi
-  [ -n "$res" ] && printf '%s\n' "$res"
-  [ "$rc" -eq 0 ] || exit "$rc"
-  HATCH_NO_REAP=1 "$here/hatch-ledger" add "$l_host" "$l_agent" "$l_session" "$slug" "$l_out" "$expect" "$round" "$(model_col)" >/dev/null 2>&1
+  [ -n "$role" ] || { [ -z "$res" ] || printf '%s\n' "$res"; }
+  if [ "$rc" -ne 0 ]; then
+    [ -z "$role" ] || [ "$rc" -eq 3 ] || role_uncertain "$l_host" "$l_session" "$task" "$round" "$l_out"
+    exit "$rc"
+  fi
+  HATCH_LIFECYCLE_LOCKED=1 HATCH_NO_REAP=1 "$here/hatch-ledger" add "$l_host" "$l_agent" "$l_session" "$slug" "$l_out" "$expect" "$round" "$(model_col)" "$role" "$task" >/dev/null || { [ -z "$role" ] || role_uncertain "$l_host" "$l_session" "$task" "$round" "$l_out"; exit 1; }
+  [ -z "$role" ] || printf '%s\n' "$res"
   exit 0
 fi
 
@@ -108,18 +199,39 @@ if [ -n "$host" ] && [ -z "$cont" ]; then
   case "$path" in "$HOME"/*) path="~${path#"$HOME"}" ;; "$HOME") path="~" ;; esac
   args=(--no-ledger --slug "$slug" --expect "$expect"); [ -n "$reuse" ] && args+=(--reuse); [ -n "$worktree" ] && args+=(--worktree)
   [ -n "$readonly" ] && args+=(--readonly); [ -n "$force" ] && args+=(--force); [ -n "$anydir" ] && args+=(--any-dir)
+  if [ -z "$role" ]; then
+    reserved_names="$("$here/hatch-ledger" role-names "$host")" || exit 1
+    if grep -Eq -- "${slug}(-[0-9]+)?$" <<<"$reserved_names"; then
+      remote_prefix="$(hatch_remote_cmd "$host" tmux show-option -gqv "@${agent}_session_prefix" 2>/dev/null)"
+      base="${remote_prefix:-$agent-}$slug"
+      if awk -v b="$base" '$0==b || (index($0,b "-")==1 && substr($0,length(b)+2) ~ /^[0-9]+$/) { found=1 } END {exit !found}' <<<"$reserved_names"; then
+        args+=(--reserved-names "$reserved_names")
+      fi
+    fi
+  fi
+  [ -n "$role" ] && args+=(--role "$role" --task "$task")
+  [ -n "$fresh" ] && args+=(--fresh --out "$retired_out" --role-dir "$role_dir" --retire-round "$retire_round")
   [ -n "$branch" ] && args+=(--branch "$branch"); [ -n "$model" ] && args+=(--model "$model"); [ -n "$effort" ] && args+=(--effort "$effort")
-  res="$(hatch_remote_cmd "$host" hatch-launch "${args[@]}" "$agent" "$path" "$prompt")" || { printf '%s\n' "$res"; exit 1; }
-  printf '%s\n' "$res"
+  res="$(hatch_remote_cmd "$host" hatch-launch "${args[@]}" "$agent" "$path" "$prompt")" || {
+    rc=$?
+    if [ -z "$role" ]; then rc=1
+    elif [ "$rc" -ne 3 ]; then role_uncertain "$host" "$target" "$task" 1 "${retired_out:-unknown}"; fi
+    printf '%s\n' "$res"; exit "$rc"
+  }
+  [ -n "$role" ] || printf '%s\n' "$res"
   line="$(printf '%s\n' "$res" | grep -m1 '^session=')"
-  HATCH_NO_REAP=1 "$here/hatch-ledger" add "$host" "$agent${readonly:+/ro}" "$(sed 's/.*session=\([^ ]*\).*/\1/' <<<"$line")" "$slug" "$(sed 's/.*out=\([^ ]*\).*/\1/' <<<"$line")" "$expect" 1 "$(model_col)" >/dev/null 2>&1
+  session="${line#session=}"; session="${session%% *}"
+  new_out="${line#* out=}"; new_out="${new_out% host=*}"
+  if [ -n "$role" ] && { [ "$session" != "$target" ] || [ -z "$new_out" ] || [ "$new_out" = "$line" ]; }; then
+    role_uncertain "$host" "$target" "$task" 1 unknown; exit 1
+  fi
+  [ -n "$retired_out" ] && HATCH_LIFECYCLE_LOCKED=1 "$here/hatch-ledger" note "$session" retired "$host" --exact >/dev/null
+  HATCH_LIFECYCLE_LOCKED=1 HATCH_NO_REAP=1 "$here/hatch-ledger" add "$host" "$agent${readonly:+/ro}" "$session" "$slug" "$new_out" "$expect" 1 "$(model_col)" "$role" "$task" >/dev/null || { [ -z "$role" ] || role_uncertain "$host" "$session" "$task" 1 "$new_out"; exit 1; }
+  [ -z "$role" ] || printf '%s\n' "$res"
   exit 0
 fi
 
 # ---------------------------------------------------------------- on the host where the agent runs
-DIR="$(cd "$here/../../scripts" && pwd)"
-# shellcheck source=../../scripts/helpers.sh
-. "$DIR/helpers.sh"
 prefix="$(agent_option "$agent" session_prefix "$default_prefix")"
 cmd="${cmd_override:-$(agent_option "$agent" command "$default_cmd")}"   # HATCH_CLAUDE_CMD / HATCH_CODEX_CMD: stand-in agents for tests
 args="$(agent_option "$agent" args '')"
@@ -130,8 +242,7 @@ agent_flags() {   # per-launch flags; never the global tmux options
   local f=""
   case "$agent" in
   codex)  [ -n "$model" ] && f="$f -m $(printf '%q' "$model")"; [ -n "$effort" ] && f="$f -c model_reasoning_effort=$(printf '%q' "$effort")"
-          # A writing Codex may write inside its working tree only; the report lives in the out directory, so
-          # make that writable too (otherwise every report write stops at a permission prompt).
+          # Writers inherit the configured sandbox. Also allow the report directory in workspace-write mode.
           if [ -n "$readonly" ]; then f="$f --sandbox read-only"
           elif [ -n "${out:-}" ]; then f="$f --add-dir $(printf '%q' "$out")"; fi ;;
   claude) [ -n "$model" ] && f="$f --model $(printf '%q' "$model")"; [ -n "$effort" ] && f="$f --effort $(printf '%q' "$effort")"
@@ -142,23 +253,40 @@ agent_flags() {   # per-launch flags; never the global tmux options
 report_name() { if [ "$1" -gt 1 ]; then printf 'report-%s.md' "$1"; else printf 'report.md'; fi; }
 footer_for() {   # <round>
   local r="$1" rep; rep="$out/$(report_name "$1")"
-  local task="Task id: ${slug}."; [ "$r" -gt 1 ] && task="Task id: ${slug}, round ${r} (a follow-up in this same session)."
+  local intro="Task id: ${slug}."; [ "$r" -gt 1 ] && intro="Task id: ${slug}, round ${r} (a follow-up in this same session)."
+  if [ -n "$role" ]; then
+    intro="Task id: $task. Round $r of the $role session for ${slug%-$role}.
+Earlier tasks in this conversation are background only. This round's instructions are the only ones in force.
+Work that can run in parallel is yours to split (your own sub-agents / parallel tools). Do not ask for another session.
+Role rules: $out/ROLE.md (reread it if you no longer have it in context)."
+  fi
   if [ -n "$readonly" ]; then
-    printf '\n\n---\n[hatch] %s This is a read-only investigation/review: do not change files. Your final response is saved as the deliverable, so make it self-contained with the headings '"'## Summary', '## Findings' (cite file:line), '## Validation' (what you actually read or ran) and '## Handoff'"' (unverified points, next steps).' "$task"
+    if [ -n "$role" ]; then
+      intro="$intro
+Start your final answer with this exact standalone line:
+Task: $task / Round: $r"
+    fi
+    printf '\n\n---\n[hatch] %s This is a read-only investigation/review: do not change files. Your final response is saved as the deliverable, so make it self-contained with the headings '"'## Summary', '## Findings' (cite file:line), '## Validation' (what you actually read or ran) and '## Handoff'"' (unverified points, next steps).' "$intro"
   else
     local keep=""; [ "$r" -gt 1 ] && keep=" Leave the reports of earlier rounds untouched."
-    printf '\n\n---\n[hatch] %s When the work is done you must write the results to %s with the headings '"'## Summary', '## Changed' (files changed), '## Validation' (checks you ran and their results) and '## Handoff'"' (unfinished work, next steps, anything needing confirmation).%s Write the report before ending your final response. If you stop at a question or an approval, write the current state to the report as well.' "$task" "$rep" "$keep"
+    printf '\n\n---\n[hatch] %s When the work is done you must write the results to %s with the headings '"'## Summary', '## Changed' (files changed), '## Validation' (checks you ran and their results) and '## Handoff'"' (unfinished work, next steps, anything needing confirmation).%s Write the report before ending your final response. If you stop at a question or an approval, write the current state to the report as well.' "$intro" "$rep" "$keep"
   fi
 }
-# One writer per working tree (read-only sessions do not count). <dir> <session to ignore>
+# One implementation writer per working tree (legacy writers count). <dir> <session to ignore>
 check_writer() {
   [ "$mode" = write ] && [ -z "$force" ] || return 0
-  local s_ m_ p_
+  case "$role" in review|research) return 0 ;; esac
+  local s_ m_ p_ other_role
   for s_ in $(tmux list-sessions -F '#S' 2>/dev/null); do
     [ "$s_" = "$2" ] && continue
     m_="$(tmux show-options -t "$s_" -qv @hatch_mode 2>/dev/null)"; [ "$m_" = write ] || continue
+    other_role="$(tmux show-options -t "$s_" -qv @hatch_role 2>/dev/null)"
+    case "$other_role" in review|research) continue ;; esac
     p_="$(tmux display-message -p -t "$s_" '#{pane_current_path}' 2>/dev/null)"
     [ "$p_" = "$1" ] || [ "$(tmux display-message -p -t "$s_" '#{session_path}' 2>/dev/null)" = "$1" ] || continue
+    if [ "$other_role" = impl ]; then
+      refuse "implementation writer '$s_' already owns $1; use --role impl --task <id> to continue it, or --worktree for separate work"
+    fi
     if [ "$(tmux show-options -t "$s_" -qv @hatch_closed 2>/dev/null)" = 1 ]; then
       echo "refused: writer session '$s_' is still alive in $1, but its task is already closed (it is in the grace period before being ended)." >&2
       echo "  to give that session a follow-up: hatch-launch --continue $s_ \"<instructions>\"; to free the directory now: hatch-end $s_" >&2
@@ -175,12 +303,20 @@ check_writer() {
 start_session() {   # <session> <dir> <command line>
   local launch_path="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:$PATH"
   local wrapped="export PATH=$(printf '%q' "$launch_path"); $3 || { rc=\$?; echo \"[hatch] $cmd exited with status \$rc\"; sleep 60; }"
-  tmux new-session -d -s "$1" -c "$2" "$wrapped" || exit 1
+  if [ -n "$role" ]; then
+    gate="hatch-start-$$"
+    wrapped="$(printf '%q' "$(command -v tmux)") wait-for $(printf '%q' "$gate") && { $wrapped; }"
+  fi
+  live_id="$(tmux new-session -d -P -F '#{session_id}' -s "$1" -c "$2" "$wrapped")" || exit 1
 }
 mark_session() {   # <session> <round>
   tmux set-option -t "$1" detach-on-destroy on
   tmux set-option -t "$1" @hatch_openclaw 1
   tmux set-option -t "$1" @hatch_slug "$slug"
+  if [ -n "$role" ]; then
+    tmux set-option -t "$1" @hatch_role "$role"
+    tmux set-option -t "$1" @hatch_task "$task"
+  fi
   tmux set-option -t "$1" @hatch_out "$out"
   tmux set-option -t "$1" @hatch_mode "$mode"
   tmux set-option -t "$1" @hatch_round "$2"
@@ -191,41 +327,106 @@ mark_session() {   # <session> <round>
   return 0
 }
 
+verify_role_session() {   # refuse to send to or end an unrelated tmux session that took this name
+  [ "$(tmux show-options -t "$1" -qv @hatch_role)" = "$role" ] &&
+    [ "$(tmux show-options -t "$1" -qv @hatch_out)" = "$2" ] &&
+    [ "$(tmux show-options -t "$1" -qv @hatch_openclaw)" = 1 ] || refuse "$1 does not match its ledger entry"
+}
+verify_role_dir() {   # <meta.json>, when the caller supplied a directory
+  [ -n "$role_dir" ] || return 0
+  [ -r "$1" ] || refuse "cannot verify the checkout for $session without $1"
+  local saved
+  saved="$(jq -er '.source_dir // .cwd' "$1")" || return 1
+  [ "$(cd "$saved" 2>/dev/null && pwd -P)" = "$role_dir" ] || refuse "$session belongs to $saved; use a distinct --repo for $role_dir"
+}
+role_fields=""; [ -n "$role" ] && role_fields=" role=$role task=$task"
+
 # ---------------------------------------------------------------- --continue, host side
 if [ -n "$cont" ]; then
   session="$cont"
   [ -n "$out" ] && [ -f "$out/meta.json" ] || { echo "cannot continue $session: $out/meta.json is missing on $me" >&2; exit 1; }
+  verify_role_dir "$out/meta.json" || exit 1
   path="$(jq -r '.cwd // empty' "$out/meta.json")"
   [ -d "$path" ] || { echo "cannot continue $session: its directory $path no longer exists" >&2; exit 1; }
+  if [ -n "$role" ] && [ -n "$worktree" ]; then
+    source_dir="$(jq -er '.source_dir // .cwd' "$out/meta.json")" || exit 1
+    root="$(git -C "$source_dir" rev-parse --show-toplevel)" || exit 1
+    requested="$(worktree_path "$root" "${branch:-$slug}")"
+    [ "$(cd "$requested" 2>/dev/null && pwd -P)" = "$(cd "$path" && pwd -P)" ] && [ "$(git -C "$path" branch --show-current)" = "${branch:-$slug}" ] ||
+      refuse "$session is in $path and does not use the requested worktree $requested"
+  fi
   check_writer "$path" "$session"
   full_prompt="${prompt}$(footer_for "$round")"
-  if tmux has-session -t "=$session" 2>/dev/null; then
-    mark_session "$session" "$round"
-    "$here/hatch-send" "$session" "$full_prompt" || exit 1
+  live_id="$(tmux display-message -p -t "=$session:" '#{session_id}' 2>/dev/null)"
+  if [ -n "$role" ]; then
+    prior=$((round - 1))
+    jq -e --arg r "$role" --argjson prior "$prior" '.role==$r and .round==$prior' "$out/meta.json" >/dev/null ||
+      refuse "$session metadata does not match ledger round $prior in $out; inspect before retrying"
+    prior_task="$(jq -r '.rounds[-1].task // ""' "$out/meta.json")"
+    prior_report="$out/$(report_name "$prior")"
+    # An explicit continuation can recover the same task after interruption.
+    # An ordinary new task waits for both the previous report and idle.
+    if [ -n "$live_id" ]; then
+      verify_role_session "$live_id" "$out"
+      [ "$(tmux show-options -t "$live_id" -qv @hatch_round)" = "$prior" ] ||
+        refuse "$session is not on ledger round $prior"
+      . "$here/_alive.sh"
+      check_interruption=""
+      if [ "$prior_task" = "$task" ]; then check_interruption="$recover_task"; fi
+      deadline=$((SECONDS + ${HATCH_TURN_WAIT_SEC:-6}))
+      while :; do
+        if HATCH_CHECK_INTERRUPTION="$check_interruption" "$here/hatch-list" | hatch_role_is_idle "$session"; then
+          if [ -s "$prior_report" ] || { [ "$prior_task" = "$task" ] && [ -n "$recover_task" ]; }; then break; fi
+          [ "$SECONDS" -lt "$deadline" ] ||
+            refuse "$session round $prior has no report in $out; inspect it or explicitly continue task $prior_task"
+        else
+          [ "$SECONDS" -lt "$deadline" ] || refuse "$session is not confirmed idle; check hatch-list or hatch-capture"
+        fi
+        sleep 0.2
+      done
+    elif [ ! -s "$prior_report" ] && { [ "$prior_task" != "$task" ] || [ -z "$recover_task" ]; }; then
+      refuse "$session round $prior has no report in $out; inspect it or explicitly continue task $prior_task"
+    fi
+  elif [ -n "$live_id" ] && [ -n "$(tmux show-options -t "$live_id" -qv @hatch_role)" ]; then
+    refuse "$session belongs to a role session; check its ledger before continuing"
+  fi
+  if [ -n "$live_id" ]; then
     state=continued
   else
+    state=resumed
     aid="$(jq -r '.agent_session_id // empty' "$out/meta.json")"
     [ -n "$aid" ] || { echo "cannot resume $session: no agent_session_id in $out/meta.json (the agent never reported one)" >&2; exit 1; }
     case "$agent" in
     codex)  full="$cmd${args:+ $args} resume$(agent_flags) $(printf '%q' "$aid") $(printf '%q' "$full_prompt")" ;;
     claude) full="$cmd${args:+ $args}$(agent_flags) --resume $(printf '%q' "$aid") $(printf '%q' "$full_prompt")" ;;
     esac
-    start_session "$session" "$path" "$full"
-    mark_session "$session" "$round"
-    state=resumed
   fi
-  jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg e "$expect" --arg p "$prompt" --argjson r "$round" --arg m "$model" --arg ef "$effort" --arg st "$state" \
-     '.status = "running" | del(.ended) | .round = $r | .rounds = ((.rounds // []) + [{round: $r, started: $t, expect: $e, prompt: $p, how: $st}])
-      | (if $m != "" then .model = $m else . end) | (if $ef != "" then .effort = $ef else . end)' "$out/meta.json" >"$out/meta.json.tmp" 2>/dev/null \
-    && mv -f "$out/meta.json.tmp" "$out/meta.json"
-  echo "session=$session state=$state slug=$slug round=$round mode=$mode out=$out report=$out/$(report_name "$round") host=$me"
+  update_round() {
+    . "$here/_lifecycle.sh"
+    hatch_update_meta "$out/meta.json" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg e "$expect" --arg p "$prompt" --argjson r "$round" --arg m "$model" --arg ef "$effort" --arg st "$state" --arg task "$task" \
+      '.status = "running" | del(.ended) | .round = $r |
+       .rounds = ((.rounds // []) + [{round:$r, started:$t, expect:$e, prompt:$p, how:$st} + (if $task != "" then {task:$task} else {} end)])
+       | (if $m != "" then .model = $m else . end) | (if $ef != "" then .effort = $ef else . end)'
+  }
+  [ -z "$role" ] || update_round || exit 1
+  if [ "$state" = continued ]; then
+    mark_session "$live_id" "$round"
+    "$here/hatch-send" "$live_id" "$full_prompt" || exit 1
+  else
+    start_session "$session" "$path" "$full"
+    mark_session "$live_id" "$round"
+    [ -z "$role" ] || tmux wait-for -S "$gate" || exit 1
+  fi
+  [ -n "$role" ] || update_round || echo "warning: could not update $out/meta.json after delivery" >&2
+  echo "session=$session state=$state slug=$slug round=$round mode=$mode out=$out report=$out/$(report_name "$round") host=$me$role_fields"
   exit 0
 fi
 
 # ---------------------------------------------------------------- a new task
+[ -z "$role" ] || check_path "$path"; check_path "${HATCH_OUT_ROOT:-$HOME/.agents/out}"
 path="${path/#\~/$HOME}"
 [ -d "$path" ] || { echo "no such directory: $path" >&2; exit 1; }
-path="$(cd "$path" && pwd -P)"
+path="$(cd "$path" && pwd -P)"; source_dir="$path"
 # Directory check: work happens inside a git repository. Never launch from a parent holding several repositories
 # (such as ~/Git). --any-dir only when running outside a repository is really intended.
 if [ -z "$anydir" ]; then
@@ -247,7 +448,7 @@ if [ -n "$reuse" ]; then
   old="${prefix}$(session_hash "$path")"
   if tmux has-session -t "=$old" 2>/dev/null; then
     [ -n "$prompt" ] && "$here/hatch-send" "$old" "$prompt"
-    echo "session=$old state=reused slug=$slug round=1 mode=$mode out=$(tmux show-options -t "$old" -qv @hatch_out) host=$me"
+    echo "session=$old state=reused slug=$slug round=1 mode=$mode out=$(tmux show-options -t "$old" -qv @hatch_out) host=$me$role_fields"
     exit 0
   fi
 fi
@@ -269,29 +470,59 @@ if [ -n "$worktree" ]; then
     [ -d "$wt" ] || { echo "git worktree add failed: ${wt_out##*$'\n'}" >&2; exit 1; }
   fi
   path="$wt"
+  [ -z "$role" ] || path="$(cd "$wt" && pwd -P)" || exit 1
 fi
 
-check_writer "$path" ""
+session="${prefix}${slug}"; retire_live=""
+if [ -n "$fresh" ] && [ -n "${retired_out:-$out}" ]; then
+  verify_role_dir "${retired_out:-$out}/meta.json" || exit 1
+  jq -e --arg r "$retire_round" '(.round|tostring)==$r' "${retired_out:-$out}/meta.json" >/dev/null || refuse "$session has a different last round"
+fi
+if [ -n "$role" ] && tmux has-session -t "=$session" 2>/dev/null; then
+  [ -n "$fresh" ] && [ -n "${retired_out:-$out}" ] || refuse "tmux session $session already exists"
+  retire_live="${retired_out:-$out}"
+  verify_role_session "$session" "$retire_live"
+  check_writer "$path" "$session"
+else
+  check_writer "$path" ""
+  n=1
+  if [ -z "$role$noledger" ]; then reserved_names="$("$here/hatch-ledger" role-names local)" || exit 1; fi
+  while tmux has-session -t "=$session" 2>/dev/null || grep -Fxq -- "$session" <<<"${reserved_names:-}"; do
+    [ -z "$role" ] || refuse "tmux session $session already exists"
+    n=$((n+1)); session="${prefix}${slug}-$n"
+  done
+fi
 
-# Deliverables directory (the out/ contract)
-out="${HATCH_OUT_ROOT:-$HOME/.agents/out}/$(date +%Y%m%d-%H%M%S)-$slug"
-mkdir -p "$out"
-
-# Session name: <prefix><slug>; -2, -3 ... on collision
-session="${prefix}${slug}"; n=1
-while tmux has-session -t "=$session" 2>/dev/null; do n=$((n+1)); session="${prefix}${slug}-$n"; done
+# Separate out directories even when two agents with the same slug start in the same second.
+root_out="${HATCH_OUT_ROOT:-$HOME/.agents/out}"; mkdir -p "$root_out" || exit 1
+base_out="$root_out/$(date +%Y%m%d-%H%M%S)-$slug"; out="$base_out"; n=1
+until mkdir "$out" 2>/dev/null; do
+  [ -d "$out" ] || { echo "cannot create out directory: $out" >&2; exit 1; }
+  n=$((n+1)); out="$base_out-$n"
+done
+if [ -n "$role" ]; then cp "$here/../roles/$role.md" "$out/ROLE.md" || exit 1; fi
 
 full_prompt="${prompt}$(footer_for 1)"
-jq -n --arg slug "$slug" --arg agent "$agent" --arg session "$session" --arg cwd "$path" --arg host "$me" \
+jq -n --arg slug "$slug" --arg agent "$agent" --arg session "$session" --arg cwd "$path" --arg source "$source_dir" --arg host "$me" \
       --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg expect "$expect" --arg prompt "$prompt" --arg mode "$mode" \
-      --arg model "$model" --arg effort "$effort" \
+      --arg model "$model" --arg effort "$effort" --arg role "$role" --arg task "$task" \
       '{slug:$slug, agent:$agent, session:$session, cwd:$cwd, host:$host, mode:$mode, model:$model, effort:$effort, started:$started,
-        expect:$expect, prompt:$prompt, status:"running", round:1, rounds:[{round:1, started:$started, expect:$expect, prompt:$prompt, how:"created"}]}' \
-      >"$out/meta.json" 2>/dev/null
+        expect:$expect, prompt:$prompt, status:"running", round:1, rounds:[{round:1, started:$started, expect:$expect, prompt:$prompt, how:"created"}]}
+       | if $role != "" then .role = $role | .rounds[0].task = $task | (if $source != $cwd then .source_dir = $source else . end) else . end' \
+      >"$out/meta.json" || exit 1
 
+# Keep the old process available until the new out, role rules and metadata are ready.
+if [ -n "$retire_live" ]; then
+  verify_role_session "$session" "$retire_live"
+  "$here/hatch-end" --no-ledger-check --owner "$role" "$retire_live" --owner-round "$retire_round" --idle-only "$session" >/dev/null || exit $?
+fi
 start_session "$session" "$path" "$cmd${args:+ $args}$(agent_flags) $(printf '%q' "$full_prompt")"
-mark_session "$session" 1
-echo "session=$session state=created slug=$slug round=1 mode=$mode out=$out host=$me"
-[ -n "$noledger" ] || HATCH_NO_REAP=1 "$here/hatch-ledger" add local "$agent${readonly:+/ro}" "$session" "$slug" "$out" "$expect" 1 "$(model_col)" >/dev/null 2>&1 || true
-[ -n "$noledger" ] || HATCH_NO_REAP=1 hatch_detach "$here/hatch-reap"   # end sessions of closed tasks
+mark_session "$live_id" 1
+[ -z "$role" ] || tmux wait-for -S "$gate" || exit 1
+echo "session=$session state=created slug=$slug round=1 mode=$mode out=$out host=$me$role_fields"
+if [ -z "$noledger" ]; then
+  [ -n "$retired_out" ] && "$here/hatch-ledger" note "$session" retired local --exact >/dev/null
+  HATCH_LIFECYCLE_LOCKED=1 HATCH_NO_REAP=1 "$here/hatch-ledger" add local "$agent${readonly:+/ro}" "$session" "$slug" "$out" "$expect" 1 "$(model_col)" "$role" "$task" >/dev/null || exit 1
+  [ -n "${HATCH_NO_REAP:-}" ] || HATCH_NO_REAP=1 hatch_detach "$here/hatch-reap"
+fi
 exit 0

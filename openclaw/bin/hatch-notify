@@ -31,23 +31,22 @@
 # What was sent or skipped, and the HTTP status, go to ~/.openclaw/hatch-notify.log (never the token or the body).
 set -uo pipefail
 env_file="${HATCH_NOTIFY_ENV:-$HOME/.openclaw/hatch-notify.env}"
-[ -r "$env_file" ] || exit 0
+wake=""
 # shellcheck disable=SC1090
-. "$env_file"
-LOG="${OPENCLAW_HATCH_LOG:-${env_file%/*}/hatch-notify.log}"
+[ ! -r "$env_file" ] || . "$env_file"
+if [ -r "$env_file" ] && [ -n "${OPENCLAW_HOOK_URL:-}" ] && [ -n "${OPENCLAW_HOOK_TOKEN:-}" ]; then wake=1; fi
+LOG=/dev/null
+[ -z "$wake" ] || LOG="${OPENCLAW_HATCH_LOG:-${env_file%/*}/hatch-notify.log}"
 log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$LOG" 2>/dev/null; return 0; }
 # Keep the log small: above 256KB keep only the last 500 lines
 if [ -f "$LOG" ] && [ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt 262144 ]; then
   tail -n 500 "$LOG" >"$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
 fi
-if [ -z "${OPENCLAW_HOOK_URL:-}" ] || [ -z "${OPENCLAW_HOOK_TOKEN:-}" ]; then
-  log "skip reason=env-incomplete (OPENCLAW_HOOK_URL / OPENCLAW_HOOK_TOKEN)"; exit 0
-fi
-
 input="$(cat 2>/dev/null)"
 event="$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)"
 cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
 sid="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
+[ -n "$wake" ] || [ "$event" = Stop ] || exit 0
 case "$event" in
 Stop)              what="turn finished (idle)" ;;
 Notification)      what="waiting: permission prompt" ;;
@@ -174,6 +173,10 @@ if [ -n "$nested" ]; then
   log "skip reason=nested-agent event=$event session=${session:-none} by=${by:-none} pid=$first (a child claude process of the session, not its own turn)"
   exit 0
 fi
+# Role completion belongs to the host even when there is no wake receiver.
+if [ -z "$wake" ]; then
+  [ -n "$pane" ] && [ -n "$(tmux show-options -t "$pane" -qv @hatch_role 2>/dev/null)" ] || exit 0
+fi
 scope="${OPENCLAW_HATCH_SCOPE:-launched}"
 launched() { [ "$(tmux show-options -t "$1" -qv @hatch_openclaw 2>/dev/null)" = 1 ]; }
 if [ "$scope" != all ]; then
@@ -218,39 +221,53 @@ if [ -n "$pane" ]; then
   if [ "$(tmux show-options -t "$pane" -qv @hatch_ending 2>/dev/null)" = 1 ]; then
     log "skip reason=ending session=$session event=$event"; exit 0   # hatch-end is shutting this session down
   fi
-  if [ "$(tmux show-options -t "$pane" -qv @hatch_closed 2>/dev/null)" = 1 ]; then
+  role="$(tmux show-options -t "$pane" -qv @hatch_role 2>/dev/null)"
+  task="$(tmux show-options -t "$pane" -qv @hatch_task 2>/dev/null)"
+  mode="$(tmux show-options -t "$pane" -qv @hatch_mode 2>/dev/null)"
+  closed="$(tmux show-options -t "$pane" -qv @hatch_closed 2>/dev/null)"
+  if [ "$closed" = 1 ]; then
     log "skip reason=closed session=$session event=$event"; exit 0   # the task is verified and closed; nothing to report
   fi
   outdir="$(tmux show-options -t "$pane" -qv @hatch_out 2>/dev/null)"
   if [ -n "$outdir" ]; then
     # Keep the agent's own session id so the conversation can be resumed after the tmux session is ended.
     if [ -n "$sid" ] && [ -f "$outdir/meta.json" ]; then
-      jq --arg sid "$sid" --arg tp "$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)" \
-        '.agent_session_id = $sid | (if $tp != "" then .transcript_path = $tp else . end)' "$outdir/meta.json" >"$outdir/meta.json.tmp" 2>/dev/null \
-        && mv -f "$outdir/meta.json.tmp" "$outdir/meta.json"
+      . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_lifecycle.sh"
+      hatch_update_meta "$outdir/meta.json" --arg sid "$sid" --arg tp "$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)" \
+        '.agent_session_id = $sid | (if $tp != "" then .transcript_path = $tp else . end)' || log "metadata update failed session=$session"
     fi
     slug="$(tmux show-options -t "$pane" -qv @hatch_slug 2>/dev/null)"
     round="$(tmux show-options -t "$pane" -qv @hatch_round 2>/dev/null)"; round="${round:-1}"
     rfile="$(tmux show-options -t "$pane" -qv @hatch_report 2>/dev/null)"; rfile="$outdir/${rfile:-report.md}"
-    # Without a report for this round, save the final response (read-only sessions cannot write files, so this
-    # is their deliverable)
-    if [ ! -f "$rfile" ] && { [ "$event" = Stop ] || [ "$event" = SessionEnd ]; }; then
-      last="$(printf '%s' "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null)"
-      if [ -z "$last" ] && [ "$round" -le 1 ]; then
-        tp="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)"
+    # Read-only role answers must identify their own task and round. A delayed
+    # Stop may still wake the coordinator, but cannot publish another report.
+    attributed=1
+    last="$(jq -r '.last_assistant_message // empty' <<<"$input")"
+    if [ -n "$role" ] && [ "$mode" = read ] && [ "$event" = Stop ] &&
+       ! grep -Fxq "Task: $task / Round: $round" <<<"${last%%$'\n'*}"; then
+      attributed=""
+      log "unmatched read-only Stop session=$session round=$round"
+    fi
+    if [ -n "$attributed" ] && [ ! -e "$rfile" ] &&
+       { [ "$event" = Stop ] || { [ -z "$role" ] && [ "$event" = SessionEnd ]; }; }; then
+      if [ -z "$last" ] && [ -z "$role" ] && [ "$round" -le 1 ]; then
+        tp="$(jq -r '.transcript_path // empty' <<<"$input")"
         [ -r "$tp" ] && last="$(jq -r 'select(.type=="assistant") | .message.content | if type=="array" then map(select(.type=="text")|.text)|join("\n") else . end' "$tp" 2>/dev/null | awk 'NF{buf=buf $0 "\n"} /^$/{ } END{printf "%s", buf}' | tail -c 20000)"
       fi
-      if [ -n "$last" ]; then
-        { printf '# auto-captured final response (%s, round %s, %s)\n\n' "$session" "$round" "$(date '+%F %T')"; printf '%s\n' "$last"; } >"$rfile" 2>/dev/null \
-          && log "report auto-captured session=$session round=$round bytes=${#last}"
+      if [ -n "$last" ] && { [ -z "$role" ] || [ "$mode" = read ]; }; then
+        (set -o noclobber
+         printf '# auto-captured final response (%s, round %s, %s)\n\n%s\n' "$session" "$round" "$(date '+%F %T')" "$last" >"$rfile") 2>/dev/null ||
+          log "report capture failed session=$session round=$round"
       fi
     fi
     rtag=""; [ "$round" -gt 1 ] 2>/dev/null && rtag=" round=$round"
+    [ -z "$task" ] || rtag="$rtag task=$task"
     if [ -n "$waiting" ]; then rep=" slug=$slug$rtag (work in progress; no report is expected yet)"
-    elif [ -f "$rfile" ]; then rep=" slug=$slug$rtag report=READY (hatch-report$hostflag $session)"
+    elif [ -n "$attributed" ] && { [ -s "$rfile" ] || { [ -z "$role" ] && [ -f "$rfile" ]; }; }; then rep=" slug=$slug$rtag report=READY (hatch-report$hostflag $session)"
     else rep=" slug=$slug$rtag report=MISSING (ask the agent to write $rfile, or read hatch-capture$hostflag $session)"; fi
   fi
 fi
+[ -n "$wake" ] || exit 0
 # What a waiting agent is asking: the reason and the command (or question) from the hook payload, shortened for
 # the notice; the full text goes to a file next to the report when the session has an out directory.
 ask=""

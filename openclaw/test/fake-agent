@@ -5,9 +5,33 @@ log="${HATCH_FAKE_LOG:-/dev/null}"
 printf 'ARGV: %s\n' "$*" >>"$log"
 handle() {
   local rep
-  rep="$(printf '%s' "$1" | grep -oE '/[^ ]*/report(-[0-9]+)?\.md' | tail -1)"
+  rep="$(sed -n 's/.*must write the results to \(.*\) with the headings.*/\1/p' <<<"$1" | tail -1)"
   printf 'MSG-BEGIN\n%s\nMSG-END\n' "$1" >>"$log"
-  [ -n "$rep" ] && printf '## Summary\nfake report for %s\n' "$(basename "$rep")" >"$rep"
+  local rules round task
+  rules="$(sed -n 's/^Role rules: \(.*\)\/ROLE.md .*/\1/p' <<<"$1")"
+  round="$(sed -n 's/.*[.] Round \([0-9][0-9]*\) of the .*/\1/p' <<<"$1")"
+  task="$(sed -n 's/^\[hatch\] Task id: \([^.]*\)[.].*/\1/p' <<<"$1")"
+  # Dedicated regression cases deliver their own Stop and status records.
+  case "$1" in *no-stop-sentinel*|*explicit-recovery*) return 0 ;; esac
+  if [ -n "$rep" ]; then
+    printf '## Summary\nfake report for %s\n' "$(basename "$rep")" >"$rep"
+  elif [ -n "$rules" ] && [ -n "$round" ]; then
+    jq -cn --arg answer "Task: $task / Round: $round"$'\n''fake review' \
+      '{hook_event_name:"Stop",session_id:"fake-review-sid",last_assistant_message:$answer}' |
+      HATCH_NOTIFY_ENV="$log.no-wake" "$(dirname "$0")/../bin/hatch-notify"
+  fi
+  if [ -n "$rules" ] && [ -z "${HATCH_FAKE_NO_STATUS:-}" ]; then
+    local registry started
+    case "${HATCH_FAKE_AGENT:-claude}" in
+    codex) registry="$CODEX_HOME/hatch-status" ;;
+    *) registry="$CLAUDE_CONFIG_DIR/sessions" ;;
+    esac
+    mkdir -p "$registry"
+    if [ -r "/proc/$$/stat" ]; then started="$(sed 's/.*) //' "/proc/$$/stat" | cut -d' ' -f20)"
+    else started="$(TZ=UTC LC_ALL=C ps -o lstart= -p "$$" | awk '{$1=$1; print}')"; fi
+    jq -n --argjson pid "$$" --arg cwd "$PWD" --arg start "$started" \
+      '{kind:"interactive",pid:$pid,cwd:$cwd,procStart:$start,status:"idle",sessionId:"fake-sid",statusUpdatedAt:1}' >"$registry/fake-$$.json"
+  fi
   return 0
 }
 [ $# -gt 0 ] && handle "${!#}"
